@@ -93,6 +93,15 @@
   #define USARTx_FUNCTION GPIO_FUNCTION(3)
   #define USARTx USART5
   #define USARTx_IRQn USART5_IRQn
+#elif CONFIG_STM32_SERIAL_LPUART1
+  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PB7,PB6");
+  #define GPIO_Rx GPIO('B', 7)
+  #define GPIO_Tx GPIO('B', 6)
+  #define USARTx_FUNCTION GPIO_FUNCTION(8)
+  #define USARTx LPUART1
+  #define USARTx_IRQn LPUART1_IRQn
+  #define USARTx_IRQHandler LPUART1_IRQHandler
+  #define LPUART_BRR 1
 #endif
 
 #if CONFIG_MACH_STM32F031
@@ -163,9 +172,13 @@ serial_init(void)
     enable_pclock((uint32_t)USARTx);
 
     uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
+#if defined(LPUART_BRR)
+    USARTx->BRR = DIV_ROUND_CLOSEST((uint64_t)pclk * 256, CONFIG_SERIAL_BAUD) & 0xFFFFF;
+#else
     uint32_t div = DIV_ROUND_CLOSEST(pclk, CONFIG_SERIAL_BAUD);
     USARTx->BRR = (((div / 16) << USART_BRR_DIV_MANTISSA_Pos)
                    | ((div % 16) << USART_BRR_DIV_FRACTION_Pos));
+#endif
     USARTx->CR3 = USART_CR3_OVRDIS; // disable the ORE ISR
     USARTx->CR1 = CR1_FLAGS;
     armcm_enable_irq(USARTx_IRQHandler, USARTx_IRQn, 0);

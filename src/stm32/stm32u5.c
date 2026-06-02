@@ -147,6 +147,7 @@ void stm32_clock_init(void)
     /* Step 8: peripheral clock gates */
     U5_RCC_AHB2ENR1 |= (1u << 0)    /* GPIOA */
                      | (1u << 1)     /* GPIOB */
+                     | (1u << 6)      /* GPIOG */
                      | (1u << 14);   /* USB OTG FS (OTGEN) */
     U5_RCC_CCIPR3    = (U5_RCC_CCIPR3 & ~(7u << 0)) | (2u << 0); /* LPUART1 ← HSI16 */
     U5_RCC_APB3ENR  |= (1u << 6);   /* LPUART1EN */

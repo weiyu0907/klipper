@@ -28,6 +28,9 @@ config BOARD_DIRECTORY
 
 choice
     prompt "Processor model"
+    config MACH_STM32U585
+    bool "STM32U585 (Uno Q)"
+
     config MACH_STM32F103
         bool "STM32F103"
         select MACH_STM32F1
@@ -72,19 +75,15 @@ choice
     config MACH_STM32G070
         bool "STM32G070"
         select MACH_STM32G0
-        select MACH_STM32G07x
     config MACH_STM32G071
         bool "STM32G071"
         select MACH_STM32G0
-        select MACH_STM32G07x
     config MACH_STM32G0B0
         bool "STM32G0B0"
         select MACH_STM32G0
-        select MACH_STM32G0Bx
     config MACH_STM32G0B1
         bool "STM32G0B1"
         select MACH_STM32G0
-        select MACH_STM32G0Bx
     config MACH_STM32G431
         bool "STM32G431"
         select MACH_STM32G4
@@ -155,7 +154,7 @@ config HAVE_STM32_USBFS
     default y if (MACH_STM32F1 || MACH_STM32F070) && !STM32_CLOCK_REF_INTERNAL
 config HAVE_STM32_USBOTG
     bool
-    default y if MACH_STM32F2 || MACH_STM32F4 || MACH_STM32F7 || MACH_STM32H7
+    default y if MACH_STM32F2 || MACH_STM32F4 || MACH_STM32F7 || MACH_STM32H7 || MACH_STM32U585
 config STM32_USB_DOUBLE_BUFFER_TX
     bool
     default y
@@ -174,6 +173,7 @@ config HAVE_STM32_USBCANBUS
 
 config MCU
     string
+    default "stm32u585xx" if MACH_STM32U585
     default "stm32f031x6" if MACH_STM32F031
     default "stm32f042x6" if MACH_STM32F042
     default "stm32f070xb" if MACH_STM32F070
@@ -200,6 +200,7 @@ config MCU
 
 config CLOCK_FREQ
     int
+    default 160000000 if MACH_STM32U585
     default 48000000 if MACH_STM32F0
     default 64000000 if MACH_STM32F103 && STM32_CLOCK_REF_INTERNAL
     default 72000000 if MACH_STM32F103
@@ -219,6 +220,7 @@ config CLOCK_FREQ
 
 config FLASH_SIZE
     hex
+    default 0x200000 if MACH_STM32U585
     default 0x8000 if MACH_STM32F031 || MACH_STM32F042 || MACH_STM32F070x6
     default 0x20000 if (MACH_STM32F070 || MACH_STM32F072) && !MACH_STM32F070x6
     default 0x10000 if MACH_STM32F103 || MACH_STM32L412 # Flash size of stm32f103x8 (64KiB)
@@ -240,6 +242,7 @@ config RAM_START
 
 config RAM_SIZE
     hex
+    default 0xc0000 if MACH_STM32U585
     default 0x1000 if MACH_STM32F031
     default 0x1800 if MACH_STM32F042
     default 0x1800 if MACH_STM32F070x6
@@ -316,11 +319,16 @@ choice
     config STM32_FLASH_START_20000
         bool "128KiB bootloader" if MACH_STM32H743 || MACH_STM32H723 || MACH_STM32F7
 
-    config STM32_FLASH_START_0000
+    config STM32_BOOTLOADER_960KiB
+    bool "960KiB offset (0x080F0000)"
+    depends on MACH_STM32U585
+
+config STM32_FLASH_START_0000
         bool "No bootloader"
 endchoice
 config FLASH_APPLICATION_ADDRESS
     hex
+    default 0x080F0000 if STM32_BOOTLOADER_960KiB
     default 0x8000800 if STM32_FLASH_START_800
     default 0x8001000 if STM32_FLASH_START_1000
     default 0x8002000 if STM32_FLASH_START_2000
@@ -400,6 +408,11 @@ choice
         bool "USB (on PB14/PB15)"
         depends on MACH_STM32H743 || MACH_STM32H750
         select USBSERIAL
+    config STM32_SERIAL_LPUART1
+        bool "Serial (on LPUART1 PA3/PA2)"
+        depends on MACH_STM32U585
+        select SERIAL
+
     config STM32_SERIAL_USART1
         bool "Serial (on USART1 PA10/PA9)"
         select SERIAL
@@ -517,7 +530,7 @@ choice
         bool "CAN bus (on PB0/PB1)"
         depends on HAVE_STM32_FDCANBUS
     config STM32_CMENU_CANBUS_PD12_PD13
-        bool "CAN bus (on PD12/PD13)"
+        bool "CAN bus (on PD12/PB13)"
         depends on HAVE_STM32_FDCANBUS
     config STM32_CMENU_CANBUS_PC2_PC3
         bool "CAN bus (on PC2/PC3)"

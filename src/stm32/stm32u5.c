@@ -21,9 +21,10 @@
 #define U5_RCC_CCIPR1   (*(volatile uint32_t *)(U5_RCC_BASE + 0x0E0))
 #define U5_RCC_CCIPR3   (*(volatile uint32_t *)(U5_RCC_BASE + 0x0E8))
 
-/* PWR: VOSR at +0x0C, SVMCR at +0x10 */
+/* PWR: VOSR at +0x0C, SVMCR at +0x10, SVMSR at +0x3C */
 #define U5_PWR_VOSR     (*(volatile uint32_t *)(U5_PWR_BASE + 0x00C))
 #define U5_PWR_SVMCR    (*(volatile uint32_t *)(U5_PWR_BASE + 0x010))
+#define U5_PWR_SVMSR    (*(volatile uint32_t *)(U5_PWR_BASE + 0x03C))
 
 /* Flash */
 #define U5_FLASH_ACR    (*(volatile uint32_t *)(0x40022000UL))
@@ -83,11 +84,11 @@ static void stm32u5_pll1_init(void)
                     | (1u << 18);   /* PLL1REN          */
 
     /*
-     * PLL1DIVR:
-     *   bits[8:0]   PLL1N = 10  → VCO = 16 × 10 = 160 MHz
-     *   bits[30:24] PLL1R = 0   → SYSCLK = VCO / (0+1) = 160 MHz
+     * PLL1DIVR fields store N-1, P-1, Q-1, R-1 (RM0456).
+     *   PLL1N-1 = 9  → N=10 → VCO = 16×10 = 160 MHz
+     *   PLL1R-1 = 0  → R=1  → SYSCLK = 160/1 = 160 MHz
      */
-    U5_RCC_PLL1DIVR = (10u << 0)    /* PLL1N */
+    U5_RCC_PLL1DIVR = (9u  << 0)    /* PLL1N-1: N=10 */
                     | (0u  << 9)     /* PLL1P */
                     | (0u  << 16)    /* PLL1Q */
                     | (0u  << 24);   /* PLL1R = /1 */
@@ -141,8 +142,11 @@ void stm32_clock_init(void)
     /* Step 6: USB clock source = HSI48 (CCIPR1 ICLKSEL bits[27:26] = 0b00) */
     U5_RCC_CCIPR1 &= ~(3u << 26);
 
-    /* Step 7: unlock VDDUSB supply (PWR_SVMCR bit28 = USV) */
-    U5_PWR_SVMCR |= (1u << 28);
+    /* Step 7: VDDUSB (bit28=USV) + VDDIO2 (bit29=IO2SV) supply valid
+     * PWR_SVMCR offset=0x10, PWR_SVMSR offset=0x3C (NOT 0x88 which is PUCRH)
+     * HARDWARE NOTE: Uno Q PCB leaves VDDIO2 unconnected → VDDIO2RDY never sets.
+     * When VDDIO2 is wired to VDD, add: while (!(U5_PWR_SVMSR & (1u << 25))); */
+    U5_PWR_SVMCR |= (1u << 28) | (1u << 29);
 
     /* Step 8: peripheral clock gates */
     U5_RCC_AHB2ENR1 |= (1u << 0)    /* GPIOA */

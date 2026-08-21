@@ -29,9 +29,9 @@
   #define USARTx USART1
   #define USARTx_IRQn USART1_IRQn
 #elif CONFIG_STM32_SERIAL_USART2
-  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA3,PA2");
+  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA3,PG7");
   #define GPIO_Rx GPIO('A', 3)
-  #define GPIO_Tx GPIO('A', 2)
+  #define GPIO_Tx GPIO('G', 7)
   #define USARTx_FUNCTION GPIO_FUNCTION( \
             (CONFIG_MACH_STM32H7 | CONFIG_MACH_STM32G4) ? 7 : 1)
   #define USARTx USART2
@@ -94,9 +94,9 @@
   #define USARTx USART5
   #define USARTx_IRQn USART5_IRQn
 #elif CONFIG_STM32_SERIAL_LPUART1
-  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA3,PA2");
-  #define GPIO_Rx GPIO('A', 3)
-  #define GPIO_Tx GPIO('A', 2)
+  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PG8,PG7");
+  #define GPIO_Rx GPIO('G', 8)
+  #define GPIO_Tx GPIO('G', 7)
   #define USARTx_FUNCTION GPIO_FUNCTION(8)
   #define USARTx LPUART1
   #define USARTx_IRQn LPUART1_IRQn

@@ -53,6 +53,8 @@ class SerialReader:
                 completion = self.pending_notifications.pop(response.notify_id)
                 self.reactor.async_complete(completion, params)
                 continue
+            import logging as _lg
+#             _lg.warning("BG_THREAD_PARSE: count=%d msg=%s notify_id=%d", count, bytes(response.msg[0:count]).hex(), response.notify_id)
             params = self.msgparser.parse(response.msg[0:count])
             params['#sent_time'] = response.sent_time
             params['#receive_time'] = response.receive_time
@@ -200,7 +202,7 @@ class SerialReader:
                              self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
-            stk500v2_leave(serial_dev, self.reactor)
+            # stk500v2_leave(serial_dev, self.reactor)  # disabled for QRB2210
             ret = self._start_session(serial_dev)
             if ret:
                 break
@@ -318,6 +320,8 @@ class SerialRetryCommand:
         self.last_params = None
         self.serial.register_response(self.handle_callback, name, oid)
     def handle_callback(self, params):
+        import logging as _lg
+#        _lg.warning("HANDLE_CALLBACK: name=%s params=%s", self.name, params)
         self.last_params = params
     def get_response(self, cmds, cmd_queue, minclock=0, reqclock=0,
                      retry=True):

@@ -122,3 +122,5 @@ serialflash: $(OUT)klipper.bin
 
 # U585 專屬開機引導
 src-$(CONFIG_MACH_STM32U585) += stm32/u5_main.c stm32/stm32u5.c
+# Milestone 2A: Stop2 進出可行性驗證（見 stm32u5_lowpower.c 檔頭註解）
+src-$(CONFIG_MACH_STM32U585) += stm32/stm32u5_lowpower.c

@@ -33,8 +33,16 @@
 #define U5_CRS_BASE     0x40006000UL
 #define U5_CRS_CR       (*(volatile uint32_t *)(U5_CRS_BASE + 0x000))
 
-static void stm32u5_voltage_scale1(void)
+/* 所有忙等迴圈共用的逾時上限（次數，非時間）。任何一段忙等都不准
+ * 用不設上限的 while：PLL 鎖不上、電壓調節沒 ready 等硬體異常時，
+ * 有上限才不會把 stop2_once() 喚醒後的還原序列變成死迴圈——那會被
+ * 誤判成「Stop2 醒不來」，其實是時鐘還原卡死，查錯方向會抓錯。 */
+#define U5_WAIT_LOOPS   200000u
+
+static uint32_t stm32u5_voltage_scale1(void)
 {
+    uint32_t i, timeout = 0;
+
     /* PWR clock: RCC_AHB3ENR bit2 = PWREN */
     U5_RCC_AHB3ENR |= (1u << 2);
     (void)U5_RCC_AHB3ENR;
@@ -48,25 +56,50 @@ static void stm32u5_voltage_scale1(void)
 
     /* VOSR bits[17:16] = 0b11 → VOS Range 1 */
     U5_PWR_VOSR = (U5_PWR_VOSR & ~(3u << 16)) | (3u << 16);
-    while (!(U5_PWR_VOSR & (1u << 15)));    /* VOSRDY bit15 */
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {   /* VOSRDY bit15 */
+        if (U5_PWR_VOSR & (1u << 15))
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
 
     /* EPOD booster required for 160MHz: BOOSTEN bit18 */
     U5_PWR_VOSR |= (1u << 18);
-    while (!(U5_PWR_VOSR & (1u << 14)));    /* BOOSTRDY bit14 */
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {   /* BOOSTRDY bit14 */
+        if (U5_PWR_VOSR & (1u << 14))
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
+
+    return timeout;
 }
 
-static void stm32u5_flash_latency_set(uint32_t ws)
+static uint32_t stm32u5_flash_latency_set(uint32_t ws)
 {
+    uint32_t i;
+
     /* LATENCY[3:0] at bits[3:0], PRFTEN at bit8 */
     U5_FLASH_ACR = (U5_FLASH_ACR & ~0xFu) | (ws & 0xFu) | (1u << 8);
-    while ((U5_FLASH_ACR & 0xFu) != (ws & 0xFu));
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if ((U5_FLASH_ACR & 0xFu) == (ws & 0xFu))
+            break;
+    }
+    return (i >= U5_WAIT_LOOPS) ? 1u : 0u;
 }
 
-static void stm32u5_pll1_init(void)
+static uint32_t stm32u5_pll1_init(void)
 {
+    uint32_t i, timeout = 0;
+
     /* Disable PLL1 */
     U5_RCC_CR &= ~(1u << 24);
-    while (U5_RCC_CR & (1u << 25));
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if (!(U5_RCC_CR & (1u << 25)))
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
 
     /*
      * PLL1CFGR (complete config, PLL1 disabled):
@@ -94,7 +127,14 @@ static void stm32u5_pll1_init(void)
 
     /* Enable PLL1 */
     U5_RCC_CR |= (1u << 24);
-    while (!(U5_RCC_CR & (1u << 25)));
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if (U5_RCC_CR & (1u << 25))
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
+
+    return timeout;
 }
 
 static void stm32u5_hsi48_init(void)
@@ -115,27 +155,57 @@ static void stm32u5_hsi48_init(void)
  * MSIS，Step 5-8 的週邊時脈閘 / USB / CRS 設定在 Stop2 期間維持不變，
  * 喚醒後無需重跑，故不重複貼一份。
  * 非 static：由 stm32u5_lowpower.c 呼叫，原型於該檔內自行前置宣告
- * （比照 u5_main.c 對 stm32_clock_init() 的作法，不另開共用標頭）。 */
-void stm32u5_sysclk_bringup(void)
+ * （比照 u5_main.c 對 stm32_clock_init() 的作法，不另開共用標頭）。
+ *
+ * 回傳值：0 = 全程順利，非 0 = 途中至少有一段忙等逾時。逾時「不」
+ * 讓函式提早 return——每一段都只是放棄那一段的等待，序列照樣跑到
+ * 底：後面每一步該做的暫存器寫入都還是會做，只是若前面的來源沒
+ * ready，硬體本來就會拒絕把 SW/SWS 切到一個沒 ready 的來源，實際
+ * SYSCLK 會停在切換前最後一個「真的生效」的來源（重置或喚醒後預設
+ * 就是 MSIS，或已經成功切過去的 HSI16），不會變成切一半的不可用
+ * 狀態。呼叫端要判斷「是否真的到了 PLL1R」，得另外去讀 RCC_CFGR1
+ * 的 SWS，不能只看這個回傳值——這正是 Milestone 2A 審查問題 1
+ * （PLL 沒鎖上但外觀正常）的修法核心，細節見
+ * docs/stop2_2a_review.md。 */
+uint32_t stm32u5_sysclk_bringup(void)
 {
+    uint32_t i, timeout = 0;
+
     /* Step 0: switch to HSI16 as interim SYSCLK */
     U5_RCC_CR |= (1u << 8);
-    while (!(U5_RCC_CR & (1u << 10)));
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if (U5_RCC_CR & (1u << 10))
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
     U5_RCC_CFGR1 = (U5_RCC_CFGR1 & ~3u) | 1u;          /* SW = HSI16 */
-    while ((U5_RCC_CFGR1 & (3u << 2)) != (1u << 2));   /* SWS = HSI16 */
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if ((U5_RCC_CFGR1 & (3u << 2)) == (1u << 2))   /* SWS = HSI16 */
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
 
     /* Step 1: VOS Range 1 + EPOD booster (prerequisite for 160 MHz) */
-    stm32u5_voltage_scale1();
+    timeout |= stm32u5_voltage_scale1();
 
     /* Step 2: Flash latency 4WS (160 MHz @ VOS1) */
-    stm32u5_flash_latency_set(4);
+    timeout |= stm32u5_flash_latency_set(4);
 
     /* Step 3: PLL1 → 160 MHz */
-    stm32u5_pll1_init();
+    timeout |= stm32u5_pll1_init();
 
     /* Step 4: switch SYSCLK → PLL1R */
     U5_RCC_CFGR1 = (U5_RCC_CFGR1 & ~3u) | 3u;          /* SW = PLL1R */
-    while ((U5_RCC_CFGR1 & (3u << 2)) != (3u << 2));   /* SWS = PLL1R */
+    for (i = 0; i < U5_WAIT_LOOPS; i++) {
+        if ((U5_RCC_CFGR1 & (3u << 2)) == (3u << 2))   /* SWS = PLL1R */
+            break;
+    }
+    if (i >= U5_WAIT_LOOPS)
+        timeout = 1;
+
+    return timeout;
 }
 
 void stm32_clock_init(void)
@@ -145,8 +215,11 @@ void stm32_clock_init(void)
     __asm volatile ("dsb" ::: "memory");
     __asm volatile ("isb" ::: "memory");
 
-    /* Step 0-4: HSI16 interim → VOS1/EPOD → Flash 4WS → PLL1 → SW=PLL1R */
-    stm32u5_sysclk_bringup();
+    /* Step 0-4: HSI16 interim → VOS1/EPOD → Flash 4WS → PLL1 → SW=PLL1R.
+     * 回傳的逾時旗標在冷開機路徑沒有診斷管道可以回報（連 LPUART1 的
+     * 時脈閘都還沒開，Step 8 才會開），故意丟棄；Stop2 喚醒路徑
+     * （stm32u5_lowpower.c）才會真的檢查它並回報。 */
+    (void)stm32u5_sysclk_bringup();
 
     /* Step 5: HSI48 + CRS (USB 48 MHz reference) */
     stm32u5_hsi48_init();

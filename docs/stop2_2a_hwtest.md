@@ -1,5 +1,14 @@
 # Stop2 Milestone 2A — 硬體遙測掃描（IWDG 邊界）
 
+> **⚠️ 參數設計有誤，適用範圍更正**：以下從「前置檢查」到「無法從這組數據
+> 判定的事」為止的第一輪掃描，六組全部用 `cycles≥3`，總睡眠時間
+> （`cycles×period_ms`）全部 ≥1000ms，必然超過 IWDG 的 410-512ms 預算，
+> 所以**測不到「單次 Stop2 睡眠上限」（限制 B）**，只能證明「多輪累積會
+> 撞到 IWDG」（限制 A）這個較弱的結論，且該節內對 `period_ms` 邊界、LSI
+> 反推的推論都不成立（沒有做，也不應該用那節的數字去反推 LSI）。這一節
+> 保留不刪，僅供對照；正確分離限制 A / B 的量測與 LSI 反推見文件最下方
+> 新增的「cycles=1 邊界掃描」章節，結論以那一節為準。
+
 固件：`v0.13.0-470-gb48410cc2`（commit `b48410cc`），已燒錄並 verify 通過（見
 `docs/stop2_2a_hwtest.md` 前一輪的燒錄紀錄，此檔案不重複貼）。
 
@@ -467,6 +476,462 @@ console 時鐘量測，是這批數據裡最乾淨的邊界證據：
 ```
 $ ssh arduino@192.168.40.120 'sudo systemctl start klipper && sleep 15 && curl -s http://localhost:7125/printer/info; echo'
 {"result":{"state":"ready","state_message":"Printer is ready","hostname":"hunter","klipper_path":"/home/arduino/klipper","python_path":"/home/arduino/klippy-env/bin/python","process_id":4522,"user_id":1000,"group_id":1001,"log_file":"/home/arduino/printer_data/logs/klippy.log","config_file":"/home/arduino/printer_data/config/printer.cfg","software_version":"v0.13.0-470-gb48410cc2","cpu_info":"4 core ?"}}
+```
+
+`state: "ready"` 確認。
+
+---
+---
+
+# cycles=1 邊界掃描（第二輪，修正版）
+
+延續 `98c213cb`。上一節（以上）的六組測試 `cycles×period_ms` 全部
+≥1000ms，必然超過 IWDG 預算，测不到「單次 Stop2 睡眠上限」。這一節全部
+改用 `cycles=1`，把兩個限制分開量：
+
+- **限制 A（迴圈累積預算）**：N 次睡眠總和受 IWDG 約束——上一節已經（意
+  外地）證明過存在，這節用對照實驗更精確地重新驗證一次。
+- **限制 B（單次睡眠上限）**：一次 Stop2 不能超過 IWDG 逾時——這節要量
+  的重點。
+
+方法與判讀規則完全沿用上一節：只看 `get_uptime` 的 `high`/`clock` 與
+`stop2_status` 的 sendf 回報，不看 LED；重置判定一律用 `mcu_ticks` 正負，
+不用 `pwr_cr1`/`scb_scr`。
+
+## 前置
+
+執行第一次掃描時忘記先停 `klipper.service`，10 組全部因為
+`Could not exclusively lock port /dev/ttyHS1` 失敗（`console.py` 拿不到
+獨占鎖）。這不是新的失敗模式，是漏做上一節已經寫明的前置步驟，補做後
+即解決，不算需要停下來回報的情況：
+
+```
+$ ssh arduino@192.168.40.120 'sudo systemctl stop klipper; pgrep -x openocd || echo NO_OPENOCD'
+NO_OPENOCD
+```
+
+## 主掃描原始輸出（逐字，`cycles=1`，每檔 `sleep 20`）
+
+每檔指令：
+```
+(sleep 7; printf "get_uptime\n"; sleep 3; printf "test_stop2 period_ms=<P> cycles=1\n"; sleep 20; printf "get_uptime\n"; sleep 3) | timeout 45 ~/klippy-env/bin/python3 ~/klipper/klippy/console.py -b 115200 /dev/ttyHS1
+```
+
+HELP 文字與 MCU config 橫幅每檔重複，以下只列連線後的內容。
+
+### period_ms=100
+
+```
+====================       connected       ====================
+005.043: stats count=144 sum=309644 sumsq=3476502
+006.444: uptime high=230 clock=382304425
+009.551: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+010.126: stats count=57 sum=30507969 sumsq=4294967295
+INFO:root:Resetting prediction variance 12023.351: freq=160538747 diff=-15999264 stddev=120128.608
+INFO:root:Resetting prediction variance 12024.337: freq=159994367 diff=-10675827 stddev=160000.000
+INFO:root:Resetting prediction variance 12025.322: freq=159688217 diff=-6877967 stddev=160000.000
+INFO:root:Resetting prediction variance 12026.308: freq=159519295 diff=-4085879 stddev=160000.000
+INFO:root:Resetting prediction variance 12027.293: freq=159432182 diff=-1992834 stddev=160000.000
+015.109: stats count=56 sum=40702 sumsq=169073
+020.092: stats count=55 sum=38730 sumsq=143789
+025.075: stats count=56 sum=39330 sumsq=145196
+029.454: uptime high=230 clock=4060540020
+030.058: stats count=56 sum=40813 sumsq=160738
+035.041: stats count=55 sum=38770 sumsq=144405
+040.023: stats count=56 sum=39350 sumsq=145428
+```
+
+`high` 兩次都是 230（沒有跳到 0）→ **未重置**。`010.126` 那行 `sumsq`
+飽和成 `4294967295`（`0xFFFFFFFF`）——這是 Klipper 自身的排程抖動統計
+出現了一次極端離群值，佐證這段時間排程器確實被 `stop2_once()` 卡住過
+一次，跟「進了 Stop2」的結論一致，不是異常。
+
+### period_ms=200
+
+```
+====================       connected       ====================
+004.367: stats count=149 sum=323958 sumsq=3629924
+006.427: uptime high=231 clock=4193214694
+009.350: stats count=56 sum=40949 sumsq=162496
+009.637: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+014.532: stats count=56 sum=30895874 sumsq=4294967295
+019.514: stats count=55 sum=38697 sumsq=143413
+024.497: stats count=55 sum=38772 sumsq=144280
+029.438: uptime high=232 clock=3560817114
+029.479: stats count=57 sum=41455 sumsq=162636
+034.461: stats count=55 sum=38792 sumsq=144588
+039.445: stats count=55 sum=38812 sumsq=144827
+```
+
+`high` 從 231 → 232，差 1——這是 32 位元 `clock` 正常溢位一次（`clock1`
+已經很接近 2^32，`clock2` 是溢位後從頭數上來的值），**不是重置**。判定
+仍然要用完整 64 位元 `mcu_ticks` 的正負，不能只看 `high` 有沒有變。
+
+### period_ms=300
+
+```
+====================       connected       ====================
+003.815: stats count=149 sum=322597 sumsq=3616587
+006.439: uptime high=233 clock=3693912638
+008.798: stats count=56 sum=40908 sumsq=161868
+009.751: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+014.079: stats count=55 sum=31304363 sumsq=4294967295
+019.061: stats count=57 sum=41280 sumsq=169986
+024.044: stats count=55 sum=38730 sumsq=143789
+029.027: stats count=55 sum=38730 sumsq=143789
+029.450: uptime high=234 clock=3045541305
+034.009: stats count=57 sum=41413 sumsq=162145
+038.992: stats count=55 sum=38750 sumsq=144021
+043.975: stats count=55 sum=38812 sumsq=144897
+```
+
+`high` 233→234，同樣是溢位一次，`mcu_ticks` 為正 → **未重置**——這是
+主掃描裡**最後一個成功**的檔。
+
+### period_ms=350（第一個重置）
+
+```
+====================       connected       ====================
+003.343: stats count=147 sum=321539 sumsq=3614175
+006.423: uptime high=235 clock=3177071449
+008.325: stats count=57 sum=41508 sumsq=163275
+009.785: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+014.933: stats count=56 sum=37692 sumsq=129398
+019.916: stats count=55 sum=38772 sumsq=144280
+024.899: stats count=56 sum=39372 sumsq=156176
+029.433: uptime high=0 clock=3127943115
+029.881: stats count=57 sum=42788 sumsq=186287
+034.864: stats count=55 sum=38772 sumsq=144280
+039.847: stats count=56 sum=39412 sumsq=146303
+```
+
+注意：`cycle=1` 的 `stop2_status` **有**正常送達（`sws=3 pll1rdy=1
+restore_timeout=0 lptim_timeout=0`）——`stop2_once()` 本身完整跑完、
+`wfi` 有醒來、SYSCLK 有鎖回 PLL1R。但第二次 `get_uptime` 的 `high` 掉回
+0 → **後來還是重置了**。也就是說，`period_ms=350` 這組不是「Stop2 序列
+本身失敗」，而是「Stop2 序列成功完成，但完成後 MCU 在某個時間點被 IWDG
+咬掉」。這個現象在 400/425/450/475/500/550ms 全部重現，見下方結果表。
+
+### period_ms=400
+
+```
+====================       connected       ====================
+004.232: stats count=148 sum=321967 sumsq=3614696
+006.444: uptime high=1 clock=3260487879
+009.213: stats count=57 sum=42564 sumsq=181373
+009.859: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+019.939: stats count=55 sum=38104 sumsq=135778
+024.922: stats count=55 sum=38772 sumsq=154769
+029.455: uptime high=0 clock=3127743055
+029.905: stats count=58 sum=43388 sumsq=187694
+034.887: stats count=55 sum=38772 sumsq=144280
+039.870: stats count=55 sum=38812 sumsq=144896
+```
+
+`high` 從 1（上一檔重置後才剛重開機不久）掉到 0 → **重置**。
+
+### period_ms=425
+
+```
+====================       connected       ====================
+001.927: stats count=144 sum=316995 sumsq=3582543
+006.442: uptime high=1 clock=3629851159
+006.910: stats count=57 sum=41436 sumsq=162283
+009.881: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+024.919: stats count=55 sum=38104 sumsq=141273
+029.453: uptime high=0 clock=3127727085
+029.902: stats count=57 sum=42788 sumsq=186287
+034.885: stats count=56 sum=39372 sumsq=145687
+039.868: stats count=55 sum=38812 sumsq=144896
+```
+
+**重置**（`high` 1→0）。
+
+### period_ms=450
+
+```
+====================       connected       ====================
+004.297: stats count=147 sum=322750 sumsq=3627025
+006.438: uptime high=1 clock=3248766269
+009.280: stats count=56 sum=40836 sumsq=160876
+009.904: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+009.967: starting
+014.950: stats count=56 sum=38380 sumsq=138208
+019.933: stats count=55 sum=38772 sumsq=144280
+024.916: stats count=56 sum=39372 sumsq=156176
+029.449: uptime high=0 clock=3127751555
+029.899: stats count=57 sum=42788 sumsq=186287
+034.881: stats count=55 sum=38772 sumsq=144280
+039.864: stats count=56 sum=39412 sumsq=146303
+```
+
+**重置**，且這次抓到 `009.967: starting` 開機橫幅——`cycle=1` 在
+`009.904` 成功送達之後只過了 `0.063s` 就看到重開機證據，是本輪最緊的
+「已經死透」時間點，用於下方 B 邊界計算。
+
+### period_ms=475
+
+```
+====================       connected       ====================
+004.311: stats count=148 sum=323331 sumsq=3628367
+006.439: uptime high=1 clock=3246632239
+009.294: stats count=56 sum=40836 sumsq=160876
+009.930: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+014.951: stats count=72 sum=49340 sumsq=151626
+019.933: stats count=55 sum=38772 sumsq=144280
+024.916: stats count=55 sum=38772 sumsq=154769
+029.450: uptime high=0 clock=3127807935
+029.899: stats count=58 sum=43388 sumsq=187694
+034.881: stats count=55 sum=38772 sumsq=144280
+039.864: stats count=55 sum=38812 sumsq=144896
+```
+
+**重置**。
+
+### period_ms=500
+
+```
+====================       connected       ====================
+004.217: stats count=147 sum=321407 sumsq=3613469
+006.444: uptime high=1 clock=3262638339
+009.199: stats count=57 sum=42799 sumsq=186538
+009.960: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+019.938: stats count=66 sum=47097 sumsq=154402
+024.923: stats count=55 sum=38772 sumsq=154769
+029.455: uptime high=0 clock=3127894975
+029.904: stats count=58 sum=43388 sumsq=187694
+034.886: stats count=55 sum=38772 sumsq=144280
+039.869: stats count=55 sum=38812 sumsq=144896
+```
+
+**重置**。`cycle=1` 於 `009.960` 成功送達——是本輪所有檔案裡「確認活著」
+時間點最晚的一筆，用於下方 B 邊界計算。
+
+### period_ms=550
+
+```
+====================       connected       ====================
+004.245: stats count=147 sum=322730 sumsq=3626935
+006.444: uptime high=1 clock=3257960479
+009.228: stats count=57 sum=41436 sumsq=162283
+009.973: starting
+010.231: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+014.956: stats count=62 sum=30102008 sumsq=4294967295
+019.939: stats count=55 sum=38697 sumsq=143413
+029.454: uptime high=0 clock=3127537048
+029.905: stats count=57 sum=42746 sumsq=185336
+034.888: stats count=56 sum=39330 sumsq=145196
+039.871: stats count=55 sum=38770 sumsq=144405
+```
+
+**重置**。這一檔的兩行順序反常：`starting`（`009.973`）印在
+`stop2_status cycle=1`（`010.231`）**之前**。`console.py` 印出的時間戳
+是由 host 端的時鐘估計模型換算，緊接著這兩行後面就出現一串
+`Resetting prediction variance`，代表估計模型當時正處於重置導致的
+重新鎖定期間——這個順序異常很可能是模型在不穩定期間換算出的時間戳
+不可靠，而不是真的「先開機後收到舊指令的回應」。老實說：**這個順序矛盾
+我沒有辦法從現有數據解釋清楚**，只確認「重置有發生」這件事本身沒有疑義
+（`high` 1→0）。
+
+## 主掃描結果表
+
+`handler_dur` = `stop2_status cycle=1` 時間戳 − 指令送出時間（用第一個
+`get_uptime` 回應時間 + 3.000s 的管線固定延遲估算，跟第一輪掃描的估算
+方式相同）。`slept_sec` 只在「未重置」列有意義；重置列的 `mcu_ticks` 為
+負，公式不適用，標 N/A。
+
+| period_ms | 完成輪數 | handler_dur (s) | mcu_ticks | wall_sec | slept_sec | 重置? |
+|---|---|---|---|---|---|---|
+| 100 | 1/1 | 0.107 | 3,678,235,595 | 23.010 | 0.021 | 否 |
+| 200 | 1/1 | 0.210 | 3,662,569,716 | 23.011 | 0.120 | 否 |
+| 300 | 1/1 | 0.312 | 3,646,595,963 | 23.011 | 0.220 | **否（最後一個成功）** |
+| 350 | 1/1（送達後才重置） | 0.362 | 負值 | 23.010 | N/A | **是（第一個重置）** |
+| 400 | 1/1（送達後才重置） | 0.415 | 負值 | 23.011 | N/A | 是 |
+| 425 | 1/1（送達後才重置） | 0.439 | 負值 | 23.011 | N/A | 是 |
+| 450 | 1/1（送達後才重置） | 0.466 | 負值 | 23.011 | N/A | 是（另有 starting @ +0.529s） |
+| 475 | 1/1（送達後才重置） | 0.491 | 負值 | 23.011 | N/A | 是 |
+| 500 | 1/1（送達後才重置） | 0.516 | 負值 | 23.011 | N/A | 是 |
+| 550 | 1/1（順序異常，見上） | — | 負值 | 23.010 | N/A | 是 |
+
+`period_ms=100/200/300` 的 `slept_sec` 明顯小於 `period_ms/1000`（例如
+300ms 只量到 220ms），差額在三檔之間幾乎是同一個常數（約 79-80ms）。這
+不是 Stop2 睡眠時間不準，而是換算 `mcu_sec` 時假設 SYSCLK 恰好等於
+160,000,000 Hz——但 SYSCLK 是由 HSI16（內部 RC 振盪器，出廠只做粗調，
+無晶振等級精度）乘頻 10 倍得到，HSI16 本身的絕對誤差會等比例乘上去。用
+三檔數據反推 `實際頻率/160MHz` 的比值，三次算出來的結果幾乎一致
+（1.003448 / 1.003511 / 1.003531，平均 ≈1.003497，換算實際 SYSCLK
+≈160.56MHz，比標稱值快約 0.35%）；用這個修正後的頻率重算，三檔的
+`slept_sec` 分別變成 101.1ms / 199.7ms / 299.2ms——跟各自的
+`period_ms` 幾乎完全吻合（誤差 <1.1ms）。這**強烈支持**：只要 Stop2
+沒被重置，睡眠時長本身跟下達的 `period_ms` 高度一致；同時也說明用「原始
+公式（除以標稱 160MHz）」直接讀 `slept_sec` 在只有幾百毫秒訊號、卻疊在
+23 秒 wall_sec 之上時，系統性偏差（HSI16 誤差）的量級跟訊號本身相當，
+必須先扣掉這個偏差才能看出真正的睡眠時長。這個修正只適用於 SYSCLK/HSI16
+（Step 0-4 用的振盪器），跟下面 IWDG/LSI 的推算是完全不同的振盪器，
+兩者不要混為一談。
+
+## 控制實驗：驗證限制 A 獨立存在（`P_max=300` → `period_ms=150`）
+
+```
+$ ssh ... test_stop2 period_ms=150 cycles=1   （sleep 20）
+```
+```
+====================       connected       ====================
+002.947: stats count=147 sum=320125 sumsq=3600029
+006.446: uptime high=10 clock=2412012118
+007.930: stats count=56 sum=40878 sumsq=161384
+009.605: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+013.063: stats count=55 sum=30686777 sumsq=4294967295
+018.046: stats count=56 sum=40680 sumsq=168441
+023.029: stats count=55 sum=38793 sumsq=144600
+028.013: stats count=56 sum=39393 sumsq=145938
+029.457: uptime high=11 clock=1787113691
+032.995: stats count=56 sum=40826 sumsq=160757
+037.979: stats count=55 sum=38773 sumsq=144292
+042.962: stats count=56 sum=39373 sumsq=145699
+```
+`high` 10→11，`clock1=2412012118` 到 `clock2=1787113691`——單次溢位，
+**未重置**。（`cycles=1, 150ms` 成功，符合預期。）
+
+```
+$ ssh ... test_stop2 period_ms=150 cycles=2   （sleep 20）
+```
+```
+====================       connected       ====================
+002.422: stats count=146 sum=319461 sumsq=3598673
+006.443: uptime high=12 clock=1905976495
+007.405: stats count=56 sum=40878 sumsq=161384
+009.602: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+009.942: stop2_status cycle=2 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+019.938: stats count=65 sum=47165 sumsq=161497
+024.921: stats count=55 sum=38772 sumsq=154769
+029.454: uptime high=0 clock=3127648065
+029.904: stats count=57 sum=42788 sumsq=186287
+034.887: stats count=55 sum=38772 sumsq=144280
+039.870: stats count=55 sum=38812 sumsq=144896
+```
+`high` 12→0 → **重置**。兩輪都成功送達（`cycle=1`@009.602,
+`cycle=2`@009.942），但最終仍被重置。
+
+```
+$ ssh ... test_stop2 period_ms=150 cycles=4   （sleep 20）
+```
+```
+====================       connected       ====================
+004.235: stats count=146 sum=320971 sumsq=3612865
+006.444: uptime high=1 clock=3259945259
+009.216: stats count=58 sum=43399 sumsq=187945
+009.603: stop2_status cycle=1 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+009.943: stop2_status cycle=2 sws=3 pll1rdy=1 pwr_cr1=0 scb_scr=0 restore_timeout=0 lptim_timeout=0 entry_fail=0
+```
+輸出到此為止，45 秒視窗內沒有 `cycle=3`、沒有 `starting`、也沒有第二個
+`get_uptime` 回應——**這一檔本身無法直接判定是否重置**（跟第一輪
+`period_ms=400` 那次一樣的「視窗不夠長」情況，這次視窗已經放到 20 秒
+仍然沒等到）。基於 `cycles=2` 已經在幾乎相同的時間點（`009.602`/
+`009.942`，跟這裡的 `009.603`/`009.943` 幾乎一致）重置，可以**合理推論**
+`cycles=4` 大機率也會重置（甚至更早），但這是推論，不是這一檔自己的
+直接證據，報告裡明確分開標註。
+
+### A/B 兩個限制的分離結論
+
+1. **限制 A（累積效應）獨立存在，且比原先預期更早出現**：單獨
+   `period_ms=150, cycles=1` 成功，但 `cycles=2`（累積睡眠僅 300ms，
+   而且是兩次「本身完全成功」的 150ms Stop2 睡眠疊加）就重置了——
+   `cycle=1`、`cycle=2` 的 `sws`/`pll1rdy`/`restore_timeout`/
+   `lptim_timeout` 全部正常，代表 Stop2 序列本身沒有出任何錯，純粹是
+   「這次 command handler 佔用 task loop 的時間太久，餵狗餵太慢」。
+2. **限制 A 和限制 B 不是同一把尺**：單次 300ms（限制 B 系列最後一個
+   成功）之後緊接著回傳、下一輪立刻餵狗，安然無事；但
+   `2×150ms=300ms`（同樣的睡眠總量，只是拆成兩段、中間多了一次
+   LPTIM 重新武裝、一次 `busy_delay`、一次額外的 `sendf`）就重置了。
+   這代表**每一輪之間的固定開銷（LPTIM 設定/OK 輪詢、`busy_delay`、
+   `sendf` 傳輸）本身會實質消耗掉餵狗預算**，不是只有「睡多久」在算
+   總帳。
+3. 觀察到一個目前無法解釋的計時異常：`cycles=2` 這檔 `cycle=1`→`cycle=2`
+   的間隔量到 `0.340s`，遠高於單看 `period_ms=150`+已知開銷（≈12ms）
+   估算出的 `≈0.162s`。可能原因包括：`busy_delay` 在時鐘還沒完全穩定時
+   的實際耗時比預期長、LPTIM OK 輪詢在連續兩次武裝之間有額外延遲、或
+   `console.py` 的時鐘估計模型在此區間本身有系統性偏差。**這點誠實列
+   在下方「無法判定」小節，沒有足夠證據支持任何一種解釋**。
+
+## 限制 B（單次睡眠上限）與 LSI 反推
+
+用主掃描裡最緊的一組「確認活著」與「確認已死」的時間點：
+
+- **確認活著**：`period_ms=500` 的 `cycle=1` 於指令送出後 `0.516s`
+  成功送達完整的 `stop2_status`（`sws=3, restore_timeout=0`）——這證明
+  IWDG 在 `0.516s` 這個時間點**還沒有**跳脫，否則這行不可能送出來。
+- **確認已死**：`period_ms=450` 的 `starting` 開機橫幅於指令送出後
+  `0.529s` 出現——這證明 IWDG 在 `0.529s` 這個時間點**已經**跳脫並且
+  重開機完成。
+
+即真正的 IWDG 逾時 `T_timeout` 落在區間 **`(0.516s, 0.529s]`**，比第一
+輪掃描給出的鬆散區間 `(0.21s, 0.53s]` 收斂了非常多。
+
+按照公式 `f_LSI = 16384 / T`：
+
+```
+f_LSI(0.529s) = 16384 / 0.529 ≈ 30,972 Hz
+f_LSI(0.516s) = 16384 / 0.516 ≈ 31,752 Hz
+```
+
+即 **`f_LSI ∈ [30.97, 31.75] kHz`**（上下界都給，不報單一數字）。
+
+**系統性偏差說明（务必一起看，不要只看區間數字）**：這裡量到的
+`handler_dur`（指令送出到 `cycle=1` 送達，或到 `starting` 出現）只涵蓋
+「這次 command handler 自己跑了多久」，不包含「上一次 `watchdog_reset()`
+真正執行，到這次 command 開始被處理」之間可能存在的空檔。也就是說：
+
+```
+真正的「距上次餵狗經過的時間」 = (上次餵狗到指令開始處理的空檔) + handler_dur
+```
+
+只要那個空檔 ≥0（一定成立，不可能是負的），我們量到的 `handler_dur`
+**必然小於或等於**真正讓 IWDG 跳脫所需的時間，也就是這裡算出的
+`T_timeout` 區間是被系統性低估的。反映到 `f_LSI = 16384/T` 上——`T` 被
+低估 → `f_LSI` 被系統性**高估**。所以正確的講法是：「真正的 `f_LSI`
+很可能等於或**低於** `[30.97, 31.75] kHz`」，不能反過來說「這個數字證明
+LSI 比標稱 32kHz 慢」——我們連 LSI 是否比 32kHz 快或慢都無法從這個方向
+的偏差本身下結論，只知道我們算出來的區間本身是一個偏高的估計，真值只會
+更低，不會更高。
+
+## 無法從這組數據判定的事（本輪新增）
+
+1. **`cycles=2, period_ms=150` 裡 `cycle=1`→`cycle=2` 間隔異常拉長
+   （0.340s 對比預期 ≈0.162s）的真正原因**：可能是 `busy_delay` 實耗
+   時間、LPTIM 連續重新武裝的額外延遲、或 host 端時鐘估計模型的偏差，
+   數據不足以判斷是哪一種，也不排除是三者疊加。
+2. **`period_ms=550` 那檔 `starting` 印在 `cycle=1` 之前的順序矛盾**：
+   懷疑是 host 端時鐘估計模型在重置後重新鎖定期間換算出的時間戳不可靠，
+   但沒有直接證據，無法排除是別的原因（例如真正的位元組到達順序就是
+   反的，若真是如此代表對「靠印出時間戳判斷事件先後」這個方法本身的
+   可信度要打折扣，但這一點本身也無法從現有數據證實或證偽）。
+3. **`cycles=4, period_ms=150` 本身是否真的重置**：45 秒視窗內沒有任何
+   直接證據（沒有 `cycle=3`、沒有 `starting`、沒有第二個 `get_uptime`）。
+   「大機率會重置」是根據 `cycles=2` 幾乎相同時間點已重置所做的推論，
+   不是這一檔自己的觀測結果。
+4. **`T_timeout` 的精確值**：只收斂到 `(0.516s, 0.529s]` 這個區間，
+   且如上所述這個區間本身有系統性低估的偏差，無法給出比這更精確、且
+   無偏的單一數字。
+5. **`period_ms=350` 之後、`starting`（或下一筆 `get_uptime`）出現之前
+   的確切重置時刻**：這一檔沒有捕到 `starting` 橫幅，只知道重置發生在
+   `cycle=1` 送達（`+0.362s`）之後、下一個 `get_uptime` 回應
+   （`+22.6s` 附近，含重開機與 host 重新握手）之前，區間比
+   `period_ms=450` 的寬得多。
+6. **限制 A 的確切「每輪固定開銷」數字**：從 `period_ms=300`（單輪
+   `handler_dur=0.312s`，其中 `sleep=0.300s`，推得開銷≈12ms）推算的
+   「單輪開銷」跟 `cycles=2` 觀察到的輪間間隔（0.340s，遠高於
+   `0.150+0.012=0.162s`）對不上，代表「每輪固定開銷是常數」這個簡化
+   假設本身可能不成立，但數據不足以建立更精確的模型。
+7. **HSI16／SYSCLK 的 0.35% 誤差是否穩定**：只在同一次連續測試的三個
+   資料點上觀察到高度一致的比值，沒有跨電源重啟、跨溫度的重複量測，
+   不能排除這個誤差本身會隨時間或溫度漂移。
+
+## 收尾（第二輪）
+
+```
+$ ssh arduino@192.168.40.120 'sudo systemctl start klipper && sleep 15 && curl -s http://localhost:7125/printer/info; echo'
+{"result":{"state":"ready","state_message":"Printer is ready","hostname":"hunter","klipper_path":"/home/arduino/klipper","python_path":"/home/arduino/klippy-env/bin/python","process_id":6843,"user_id":1000,"group_id":1001,"log_file":"/home/arduino/printer_data/logs/klippy.log","config_file":"/home/arduino/printer_data/config/printer.cfg","software_version":"v0.13.0-470-gb48410cc2","cpu_info":"4 core ?"}}
 ```
 
 `state: "ready"` 確認。

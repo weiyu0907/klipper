@@ -39,6 +39,7 @@
 #include "compiler.h"           // __visible
 #include "board/irq.h"          // irq_disable, irq_enable
 #include "board/armcm_boot.h"   // DECL_ARMCM_IRQ
+#include "internal.h"           // IWDG
 
 // Step 0-4 的 SYSCLK 重建序列定義在 stm32u5.c，冷開機與 Stop2 喚醒共用
 // 同一份，避免複製貼上兩份（見該檔內 stm32u5_sysclk_bringup() 的註解）。
@@ -239,7 +240,15 @@ stop2_capture_status(uint32_t entry_fail, uint32_t restore_timeout,
 /* ===== Milestone 2A：Stop2 進出一次 =====
  * 呼叫前必須先跑過 lptim1_wakeup_init()，其設定的週期存在
  * s_lptim1_arr。流程：熄燈 → 武裝 LPTIM1 單次計數 → 關 SysTick →
- * 進 Stop2 → wfi 醒來 → 還原 SYSCLK/SysTick → 依讀回結果點對應的燈。 */
+ * 進 Stop2 → wfi 醒來 → 還原 SYSCLK/SysTick → 依讀回結果點對應的燈。
+ *
+ * IWDG 餵狗（wfi 前後各一次 IWDG->KR=0xAAAA）只解除「限制 A：多輪
+ * 累積耗時超過 IWDG 預算」——watchdog_reset() 是 DECL_TASK，只有排程器
+ * 的 task loop 跑到它才會餵狗，而 command_test_stop2() 的多輪迴圈整段
+ * 都在同一次 command handler 呼叫裡跑完，中途不會把控制權還給排程器，
+ * 所以要在這裡手動補餵。「限制 B：單次 Stop2 睡眠不能超過 IWDG 逾時」
+ * 依然存在且無法用韌體解決——核心整個停在 wfi 期間，兩次手動餵狗中間
+ * 的空窗依舊是同一顆 IWDG 倒數，若單次睡眠本身就超過逾時，狗必定咬人。 */
 void stop2_once(void)
 {
     volatile uint32_t i;
@@ -333,9 +342,11 @@ void stop2_once(void)
      * 「根本沒進 Stop2」最關鍵的一行。
      * isb：wfi 醒來後立刻沖刷管線，確保接下來抓到的指令流反映喚醒
      * 後的真實狀態，而不是深度睡眠前殘留的預取結果。 */
+    IWDG->KR = 0xAAAA;     /* 睡前餵飽，讓倒數從滿格開始（見限制 A/B 說明） */
     __asm volatile ("dsb" ::: "memory");
     __asm volatile ("wfi");
     __asm volatile ("isb" ::: "memory");
+    IWDG->KR = 0xAAAA;     /* 醒來立刻餵，在 sysclk_restore() 之前 */
 
     /* 醒來的第一件事永遠是拆除 SLEEPDEEP/LPMS，而不是先做時鐘還原。
      * 原因：這兩顆是「進入」深度睡眠的開關，本身不會被硬體自動清除；

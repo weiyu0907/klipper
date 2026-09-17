@@ -408,7 +408,7 @@ command_test_stop2(uint32_t *args)
 
     if (period_ms == 0 || period_ms > 2000)
         period_ms = 2000;              /* LPTIM1 ARR 16bit/32kHz 上限 */
-    if (cycles == 0 || cycles > 20)
+    if (cycles == 0 || cycles > 200)
         cycles = 5;
 
     led3_init();

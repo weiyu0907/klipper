@@ -205,7 +205,7 @@ characteristics section of the datasheet for more details」），
 
 ---
 
-## 3. B0/B1：現況讀值（已完成，B2 起需授權後補做）
+## 3. B0-B5：LSE 起振硬體測試（已完成）
 
 ```
 $ ssh arduino@192.168.40.120 'sudo systemctl stop klipper; pgrep -x openocd || echo NO_OPENOCD'
@@ -227,17 +227,95 @@ $ sudo openocd -f /home/arduino/uno_q.cfg \
 | `PWR_DBPR` | `0x46020828` | `0x00000000` | bit0 `DBP`=0，backup domain 目前是寫保護狀態，B2 需要設為 1 |
 | `RCC_BDCR` | `0x46020CF0` | `0x0C000000` | bit27 `LSIRDY`=1、bit26 `LSION`=1（IWDG 用的 LSI 已經開著且穩定，符合既有 Stop2 watchdog 韌體的行為）；`LSEDRV[4:3]`=`00`（重置預設，最低驅動力）；`LSEON`(bit0)/`LSERDY`(bit1)/`LSESYSEN`(bit7) 全為 0——**LSE 目前完全沒開** |
 
-B1 已完成，皆為純讀取，未寫入任何暫存器。
+B1 為純讀取，未寫入任何暫存器。這個讀值階段一度因為 `openocd mww`
+寫暫存器動作被 Claude Code auto-mode 分類器擋下（歸類為「Modify Shared
+Resources」）而暫停，使用者確認「B2 放行，繼續照 RMW 流程做」後，
+以下 B2-B5 才執行。
 
-**B2 起（寫 `PWR_DBPR` 設 `DBP=1`，寫 `RCC_BDCR` 只設 `LSEON`）需要對
-`openocd mww` 寫暫存器動作的明確授權** —— 這個動作被 Claude Code
-auto-mode 分類器擋下（歸類為「Modify Shared Resources」），已詢問使用者，
-使用者回覆「先寫 A 部分到文件裡，B2 等我放行」，故 B2-B5 在本次提交裡
-**尚未執行**，待授權後補做並更新本文件。
+### B2：嚴格 RMW（先讀、算、寫、讀回，不整顆覆寫）
 
-**當前板子狀態**：`klipper.service` 已重新啟動並確認 `state=ready`
-（B2 之前的操作只有讀取，沒有變動任何暫存器狀態，所以韌體行為未受
-影響）。
+```
+$ sudo openocd -f /home/arduino/uno_q.cfg \
+    -c "init" -c "halt" \
+    -c "mdw 0x46020828" \
+    -c "mww 0x46020828 0x00000001" \
+    -c "mdw 0x46020828" \
+    -c "mdw 0x46020CF0" \
+    -c "mww 0x46020CF0 0x0C000001" \
+    -c "mdw 0x46020CF0" \
+    -c "resume" -c "shutdown"
+...
+0x46020828: 00000000
+0x46020828: 00000001
+0x46020cf0: 0c000000
+0x46020cf0: 0c000001
+```
+
+（`Warn: target was in unknown state when halt was requested` 是
+openocd 內部狀態追蹤的良性警告，不影響讀寫正確性，讀回值已證實。）
+
+| 暫存器 | 寫前 | 寫後 | 動作 |
+|---|---|---|---|
+| `PWR_DBPR`（`0x46020828`） | `0x00000000` | `0x00000001` | 只設 bit0 `DBP`=1 |
+| `RCC_BDCR`（`0x46020CF0`） | `0x0C000000` | `0x0C000001` | 只設 bit0 `LSEON`=1，`LSEDRV[4:3]`（`00`）、`LSION`/`LSIRDY`（bit26/27）等其餘位元原封不動 |
+
+RMW 正確性確認：`0x0C000001` = `0x0C000000 | 0x00000001`，僅新增
+`LSEON` 這一個 bit，沒有動到其他任何位元（尤其 `LSEDRV` 仍是原本的
+`00`，符合任務「LSEDRV 保持原值不動」的要求）。
+
+### B3：LSERDY 起振時間量測（0.5/1/2/3/5 秒各讀一次，皆為 halt→mdw→
+resume 完整序列）
+
+```
+t=0.5s: 0x46020cf0: 0c000003
+t=1s:   0x46020cf0: 0c000003
+t=2s:   0x46020cf0: 0c000003
+t=3s:   0x46020cf0: 0c000003
+t=5s:   0x46020cf0: 0c000003
+```
+
+`0x0C000003` = `0x0C000001 | 0x00000002`，即 bit1 `LSERDY` 已變成 1
+（`LSEON`/`LSION`/`LSIRDY` 維持不變）。**五個時間點裡最早的一筆
+（t=0.5s，且這個 0.5s 還包含每次 openocd 重新連線 SWD 的額外開銷，
+所以實際起振時間可能比 0.5s 更短）就已經是 ready，後面 1/2/3/5s 全部
+穩定維持 `LSERDY=1`，沒有再變回 0 或跳動**。LSE 在這塊板子上起振非常
+快，不需要進入 B4（5 秒未起振的失敗處理）。
+
+★ 這比 A5 查到「RM 沒有給起振時間數值」的狀況多了一筆本板實測：至少
+在 `LSEDRV=00`（最低驅動力，重置預設值）這個設定下，這顆 32.768kHz
+振盪器（不確定是石英晶體還是陶瓷諧振器，板子規格書不在 `refs/`
+目錄裡）在 1 秒內（很可能遠少於 1 秒）就穩定起振，沒有觀察到「久久
+不起振」或「起振後又掉回未 ready」的情況。
+
+### B4：跳過
+
+5 秒內已確認起振並穩定，不觸發 B4 的失敗處理流程。
+
+### B5：重啟 klipper 驗證
+
+```
+$ sudo systemctl start klipper && sleep 20 && curl -s http://localhost:7125/printer/info
+{"result":{"state":"ready", ..., "software_version":"v0.13.0-474-ge9985ad22", ...}}
+
+$ curl -s "http://localhost:7125/printer/objects/query?mcu" | ...
+{'bytes_retransmit': 0, 'bytes_invalid': 0, 'send_seq': 129, 'receive_seq': 129,
+ 'srtt': 0.002, 'rttvar': 0.0, 'freq': 160570172, ...}
+```
+
+`state=ready`、`bytes_retransmit=0`、`bytes_invalid=0` 全部確認，B2 的
+`DBP`/`LSEON` 寫入沒有影響 klipper 的正常連線（本輪 LPUART1 kernel
+clock 選擇`RCC_CCIPR3`仍是重置預設 `000`=PCLK3，沒有改動，實際序列埠
+運作跟這次的 LSE 起振測試無關，這正是預期行為，見下方 backup domain
+說明）。
+
+### 注意：backup domain 不會被 MCU reset 清除
+
+`RCC_BDCR` 屬於 backup domain，只受 backup domain reset（`BDRST` 位元）
+或 VBAT 完全斷電影響，一般的 MCU 系統重置（`systemctl restart
+klipper`、SWD `reset run`/`reset halt`、看門狗重置）都不會清掉
+`LSEON`。也就是說，**本輪測試結束後，`LSEON=1`、`DBP=1` 會持續保持**，
+下次開機或下次 SWD 連線再讀 `RCC_BDCR`，`LSEON`/`LSERDY` 應該還是 1
+——這是預期行為，不是殘留的異常狀態。
 
 ---
 
@@ -252,9 +330,20 @@ auto-mode 分類器擋下（歸類為「Modify Shared Resources」），已詢�
    規格值。`refs/` 目錄沒有 datasheet，無法算出這顆晶片在 250000 baud
    下的真實 `DWU`/容錯裕度。第 2 節的方案建議是保守判斡，不是精確計算
    結果。
-3. **A4/A5 的 LSEDRV 建議值與起振時間**：RM 沒有給數值化的建議檔位、
-   也沒有給起振時間的典型值/最大值，這兩項都要嘛查 datasheet、要嘛
-   等 B2-B5 的實測（如果之後被授權執行）才能有具體數字。
-4. **B2-B5 尚未執行**，LSE 是否真的能在這塊板子上起振、要多久，目前
-   完全沒有實測數據，第 2 節的方案建議完全建立在 RM 文字查證上，還沒有
-   任何硬體驗證支持。
+3. **A4/A5 的 LSEDRV 建議值**：RM 沒有給數值化的建議檔位，本輪只在
+   `LSEDRV=00`（重置預設、最低驅動力）測過一組設定，且已經很快起振，
+   沒有理由再去試更高驅動力檔位（任務也明確要求「LSEDRV 保持原值不動」）
+   ——但如果換一顆板子/換一顆晶體，`00` 檔位是否還能穩定起振沒有測過，
+   不能直接類推到其他硬體。
+4. **精確起振時間**：B3 只能確認「≤0.5 秒（含 SWD 重連開銷）」就已經
+   ready，不能給出比這更精確的數字，因為每次讀值都要重新建立 SWD 連線，
+   量測解析度被連線開銷限制住，量不到「起振實際花了幾毫秒」這種精細度。
+5. **這是石英晶體還是陶瓷諧振器、廠牌/型號、走線寄生電容**：這些都會
+   影響起振時間與長期穩定度，本輪沒有board schematic/datasheet 可查，
+   無法判定這次量到的「快速起振」對其他同型板子是否有代表性。
+6. **`LPUART1SEL` 仍是重置預設 `000`(PCLK3)，本輪完全沒有把 LPUART1
+   實際接上 LSE**：B2-B5 只驗證了「LSE 本身能不能起振」，沒有驗證
+   「LPUART1 接上 LSE 之後能不能在 9600 baud 正常收發」，也沒有做 A4
+   提到的 `LSESYSEN`→`LSESYSRDY` 那一步（LSE 若要給 RTC/TAMP 以外的
+   周邊用，還需要多做這一步，本輪沒有測）。這些都是 2B 後續步驟的範圍，
+   不在本次「第 0 步」內。

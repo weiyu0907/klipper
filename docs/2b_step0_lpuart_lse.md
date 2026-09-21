@@ -319,7 +319,195 @@ klipper`、SWD `reset run`/`reset halt`、看門狗重置）都不會清掉
 
 ---
 
-## 4. 我無法判定的事
+## 4. Part D：LPUART1 改掛 LSE、實測 9600 端到端（FAIL，已還原）
+
+延續 part B 的 LSE 起振（`LSEON=1`/`LSERDY=1`），這裡把 LPUART1 的 kernel
+clock 實際切到 LSE、BRR 改成 9600 baud 對應值，測試端到端連線。**結果：
+FAIL——9600 baud 連不上，250000 也連不上（因為此時 MCU 仍是 9600/LSE
+設定），但確認不是 IWDG 重置造成，已用 `reset run` 乾淨還原。**
+
+### D0：唯讀盤點
+
+```
+$ sudo openocd -f /home/arduino/uno_q.cfg \
+    -c "init" -c "reset run" -c "sleep 2000" -c "halt" \
+    -c "mdw 0x46020CE8" -c "mdw 0x46002400" -c "mdw 0x4600240C" \
+    -c "mdw 0x4600242C" -c "mdw 0x46020CF0" -c "mdw 0x46020818" \
+    -c "mdw 0xE0044008" \
+    -c "resume" -c "shutdown"
+...
+0x46020ce8: 00000002
+0x46002400: 0000002d
+0x4600240c: 00004000
+0x4600242c: 00000000
+0x46020cf0: 0c000003
+0x46020818: 00000000
+0xe0044008: 00001800
+```
+
+| 暫存器 | 位址 | 讀值 | 解讀 |
+|---|---|---|---|
+| `RCC_CCIPR3` | `0x46020CE8` | `0x00000002` | `LPUART1SEL[2:0]=010`=**HSI16**（★ 更正 part B 的推論，見上方第 5 節第 6 點） |
+| `LPUART1_CR1` | `0x46002400` | `0x0000002D` | `UE\|RE\|TE\|RXNEIE`，`FIFOEN`（bit29，RM0456 行 188234）= 0，**FIFO 目前未啟用** |
+| `LPUART1_BRR` | `0x4600240C` | `0x00004000` | 符合預期 |
+| `LPUART1_PRESC` | `0x4600242C` | `0x00000000` | 符合預期（不分頻） |
+| `RCC_BDCR` | `0x46020CF0` | `0x0C000003` | 延續 part B：`LSION/LSIRDY=1`、`LSEON/LSERDY=1` |
+| ~~`PWR_DBPR`~~ | `0x46020818` | `0x00000000` | ★★ **這個位址不是 `PWR_DBPR`**，見下方 |
+| `DBGMCU_APB1LFZR` | `0xE0044008` | `0x00001800` | bit12 `DBG_IWDG_STOP=1`、bit11 `DBG_WWDG_STOP=1`（RM0456 行 237790 起）——halt 期間 IWDG/WWDG 凍結，不會被咬 |
+
+**BRR 與 LPUART1SEL 自洽性**：`LPUART1SEL=010`=HSI16=16MHz（標稱），
+`LPUARTDIV=256×16,000,000/250,000=16,384=0x4000`，與讀到的 `BRR` 完全
+吻合——若 kernel clock 不是 16MHz，同一個 `BRR` 換算出來的實際鮑率會
+差很多，這組讀值自洽，證實目前確實是 HSI16 在跑 250000。
+
+**★ 位址落差**：任務原給的 `0x46020818` 讀回 `0x00000000`，一開始容易
+誤判成「DBP=0」，但查 RM0456 §10.10.7（行 30402-30404）確認
+`0x46020818`（PWR 基底`0x46020800`+offset `0x18`）是 **`PWR_WUCR2`**，
+不是 `PWR_DBPR`；`PWR_DBPR` 真正位址是 `0x46020828`（§10.10.11，行
+30701-30703），也是 part B 驗證過的位址。發現後立刻停下回報，經使用者
+確認「`0x46020818` 是錯的，那是 `PWR_WUCR2`，不准碰」、改用
+`0x46020828`後才繼續 D1。
+
+### D1：準備（`DBP`、`LSESYSEN`）
+
+```
+$ sudo systemctl stop klipper; pgrep -x openocd || echo NO_OPENOCD
+NO_OPENOCD
+
+$ sudo openocd ... -c "mdw 0x46020828"
+0x46020828: 00000000
+```
+
+`DBP=0`——代表 part B 的 B2 之後，MCU 確實被重置過（D0 這次的
+`reset run` 就是一次）。`PWR_DBPR` 不屬於 backup domain，一般重置就會
+把它清回 0，這跟 `RCC_BDCR`（backup domain，讀回仍是 `0x0C000003`，
+`LSEON`/`LSERDY` 完全沒掉）行為不同，符合預期，不是異常。
+
+RMW 設 `DBP`：
+
+```
+0x46020828: 00000000   (讀)
+mww 0x46020828 0x00000001
+0x46020828: 00000001   (讀回，符合)
+```
+
+RMW `RCC_BDCR` 設 `LSESYSEN`（bit7），保留其餘位元：
+
+```
+0x46020cf0: 0c000003   (讀，= part B 結束時的狀態)
+mww 0x46020CF0 0x0C000083
+0x46020cf0: 0c000883   (讀回)
+```
+
+`0x0C000883` = `0x0C000003 | 0x00000080`（`LSESYSEN`）再加上硬體自動
+設的 bit11 `LSESYSRDY`——**第一次讀回就已經是 `0x0C000883`**，
+`LSESYSRDY` 在 32.768kHz 下只需要 2 個 LSE 時脈週期（約 61µs），遠快於
+SWD 往返一次的時間，5 秒的 poll 視窗完全用不到。
+
+### D2：切換（單一 openocd 呼叫，halt 狀態內完成）
+
+```
+$ sudo openocd -f /home/arduino/uno_q.cfg \
+    -c "init" -c "halt" \
+    -c "mdw 0x46002400" -c "mww 0x46002400 0x0000002C" -c "mdw 0x46002400" \
+    -c "mdw 0x46020CE8" -c "mww 0x46020CE8 0x00000003" -c "mdw 0x46020CE8" \
+    -c "mww 0x4600240C 0x0000036A" -c "mdw 0x4600240C" \
+    -c "mww 0x46002400 0x0000002D" -c "mdw 0x46002400" \
+    -c "resume" -c "shutdown"
+...
+0x46002400: 0000002d   ← 寫前（原值）
+0x46002400: 0000002c   ← 清 UE 後讀回，符合
+0x46020ce8: 00000002   ← 寫前（HSI16）
+0x46020ce8: 00000003   ← 改成 LSE 後讀回，符合
+0x4600240c: 0000036a   ← BRR 寫入後讀回，符合
+0x46002400: 0000002d   ← UE 設回後讀回，與 D0 原值一致，符合
+```
+
+五個讀回全部符合預期，`resume` 正常執行。`BRR=0x36A=874`：
+`256×32,768/9,600=873.8`，`DIV_ROUND_CLOSEST` 後正是 `874=0x36A`，跟
+韌體 `serial_init()` 用的公式一致。
+
+### D3：端到端驗證 —— ★ FAIL
+
+```
+$ (sleep 30; echo get_uptime; sleep 2; echo get_uptime; sleep 2; echo get_clock; sleep 3) \
+    | timeout 45 ~/klippy-env/bin/python3 ~/klipper/klippy/console.py -b 9600 /dev/ttyHS1
+==================== attempting to connect ====================
+INFO:root:Starting serial connect
+INFO:root:Timeout on connect
+ERROR:root:Wait for identify_response
+...
+serialhdl.error: Serial connection closed
+Error: Unknown command: get_uptime
+Error: Unknown command: get_uptime
+Error: Unknown command: get_clock
+（反覆 Timeout on connect / identify_response 逾時，45 秒視窗內從未
+connected，identify 永遠沒有完成，因此沒有 identify 耗時可記錄）
+```
+
+**PASS 判準（identify 完成 + get_uptime 有回應）沒有達成，判定 FAIL。**
+
+FAIL 後判準：改用 `-b 250000` 再跑一次 `get_uptime`：
+
+```
+$ (sleep 7; printf "get_uptime\n"; sleep 3) | timeout 20 \
+    ~/klippy-env/bin/python3 ~/klipper/klippy/console.py -b 250000 /dev/ttyHS1
+...
+INFO:root:Timeout on connect
+ERROR:root:Wait for identify_response
+...
+（同樣連不上，45秒/20秒視窗內沒有連上）
+```
+
+**`-b 250000` 也連不上。** 在直接做 `reset run` 還原之前，先用純讀取
+（不寫入任何暫存器）確認 D2 寫入的值是否還在：
+
+```
+$ sudo openocd ... -c "mdw 0x46002400" -c "mdw 0x46020CE8" -c "mdw 0x4600240C" ...
+0x46002400: 0000002d
+0x46020ce8: 00000003
+0x4600240c: 0000036a
+```
+
+**D2 的三個值都還在，跟寫入時完全一樣——MCU 沒有被重置（`DBG_IWDG_STOP=1`
+本來就會讓 halt 期間 IWDG 凍結，這期間也沒有進 Stop2，IWDG 本來就不會
+咬）。** 這代表：
+- `-b 250000` 連不上是理所當然的——此時 MCU 實際的 `BRR`/`CCIPR3` 仍是
+  9600/LSE 設定，不是韌體預設的 250000/HSI16，用錯誤的鮑率去連當然連不上，
+  這個檢查本身是設計來偵測「IWDG 重置、設定已被韌體重新初始化」這個
+  情境，而這次沒有發生。
+- **真正的問題是 9600/LSE 這個設定本身的端到端連線就是連不上**，不是
+  「連上但鮑率不對」，也不是「MCU 掛了」。根本原因本輪沒有查（見下方
+  第 5 節「我無法判定的事」），比較合理的懷疑方向包括：host 端
+  `/dev/ttyHS1`（名稱暗示是某種 High-Speed UART 介面）的驅動或硬體本身
+  對 9600 這種低鮑率是否有支援限制、或 LSE 的 kernel clock 雖然
+  `LSESYSRDY=1` 但實際上還沒有真正把 clock 送到 LPUART1（例如還需要
+  RM 沒提到的額外步驟）——都只是假設，沒有進一步驗證。
+
+### D4：還原
+
+```
+$ sudo openocd -f /home/arduino/uno_q.cfg -c "init" -c "reset run" -c "sleep 2000" -c "halt" \
+    -c "mdw 0x4600240C" -c "mdw 0x46020CE8" \
+    -c "resume" -c "shutdown"
+...
+0x4600240c: 00004000   ← 符合預期
+0x46020ce8: 00000002   ← 符合預期（HSI16）
+
+$ sudo systemctl start klipper && sleep 20 && curl -s http://localhost:7125/printer/info
+{"result":{"state":"ready", ...}}
+
+$ curl -s "http://localhost:7125/printer/objects/query?mcu" | ...
+{'bytes_retransmit': 0, 'bytes_invalid': 0, 'send_seq': 143, 'receive_seq': 143, 'srtt': 0.002, ...}
+```
+
+`BRR`/`CCIPR3` 都回到 D0 原值，`state=ready`、`bytes_retransmit=0`、
+`bytes_invalid=0` 全部確認。`RCC_BDCR` 的 `LSEON`/`LSESYSEN` 沒有還原
+（backup domain 不受一般重置影響），這是預期行為，跟 part B 的說明一致。
+
+---
+
+## 5. 我無法判定的事
 
 1. **A1 的 HSIKERON 疑問**：`LPUART1SEL` 的 RM 註解沒有像 `LPTIM1SEL`/
    `LPTIM34SEL` 那樣要求「HSI16 with HSIKERON=1」，本文件推論是因為
@@ -341,9 +529,22 @@ klipper`、SWD `reset run`/`reset halt`、看門狗重置）都不會清掉
 5. **這是石英晶體還是陶瓷諧振器、廠牌/型號、走線寄生電容**：這些都會
    影響起振時間與長期穩定度，本輪沒有board schematic/datasheet 可查，
    無法判定這次量到的「快速起振」對其他同型板子是否有代表性。
-6. **`LPUART1SEL` 仍是重置預設 `000`(PCLK3)，本輪完全沒有把 LPUART1
-   實際接上 LSE**：B2-B5 只驗證了「LSE 本身能不能起振」，沒有驗證
-   「LPUART1 接上 LSE 之後能不能在 9600 baud 正常收發」，也沒有做 A4
-   提到的 `LSESYSEN`→`LSESYSRDY` 那一步（LSE 若要給 RTC/TAMP 以外的
-   周邊用，還需要多做這一步，本輪沒有測）。這些都是 2B 後續步驟的範圍，
-   不在本次「第 0 步」內。
+6. ~~`LPUART1SEL` 仍是重置預設 `000`(PCLK3)，本輪完全沒有把 LPUART1
+   實際接上 LSE~~ ★ **這句話是錯的，已在 part D（第 4 節）用 D0 實測更正**：
+   `RCC_CCIPR3` 讀回是 `0x00000002`（`LPUART1SEL=010`=HSI16），不是重置
+   預設的 `000`（PCLK3）——韌體開機流程本身就已經把 LPUART1 的 kernel
+   clock 主動設成 HSI16，不是留在預設值。B2-B5 當時確實只驗證了「LSE
+   本身能不能起振」，沒有把 LPUART1 接上 LSE；這件事後來在 part D
+   （第 4 節）做了，也做了 `LSESYSEN`→`LSESYSRDY` 那一步，結果是
+   **9600 baud 端到端連線失敗**，細節見第 4 節。
+7. ★ **D3 為什麼 9600/LSE 連不上，根本原因本輪沒有查**。已知的事實只有：
+   SWD 讀回證實 `CR1`/`CCIPR3`/`BRR` 三個暫存器都精確落在計算值、
+   `LSESYSRDY=1`、MCU 沒有重置（暫存器值全程沒變）——照 RM0456 字面
+   的設定步驟看起來都做對了，但實際收發就是建立不起來。沒有做的診斷
+   包括：（a）沒有用示波器/邏輯分析儀看 `/dev/ttyHS1` 對應接腳在切換
+   後有沒有真的輸出 9600 baud 的訊號；（b）沒有查 host 端（Qualcomm
+   side）`/dev/ttyHS1` 這個 High-Speed UART 介面的驅動是否對超低鮑率
+   有限制；（c）沒有嘗試過中間鮑率（例如先切到 38400 這種 HSI16 也能跑
+   但比較低的鮑率）來縮小「是 LSE 本身的問題」還是「是鮑率太低本身的
+   問題」這兩個假設的範圍。這些都留給下一輪，本輪只如實記錄「照 RM
+   設定但連不上」這個事實，不猜測根因。

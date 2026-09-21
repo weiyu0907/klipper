@@ -507,7 +507,186 @@ $ curl -s "http://localhost:7125/printer/objects/query?mcu" | ...
 
 ---
 
-## 5. 我無法判定的事
+## 5. Part E：9600 失敗的分向診斷（2x2 矩陣）—— ★ 全部 PASS，但 identify 仍 FAIL
+
+延續 part D 的 FAIL。目的：把「連不上」拆成 TX（MCU→host）/RX（host→MCU）
+兩個方向，各自在組態 H（HSI16，對照組）跟組態 L（LSE，受測組）下用暫存器
+層級直接收發單一位元組，繞過 klippy 的 identify 協定，判斷問題出在鮑率/
+時脈本身，還是出在更高層的協定。
+
+**結論先講**：2x2 矩陣**全部 PASS**——不管哪個時脈來源，暫存器層級的
+單位元組收發完全正常。但即使如此，part D 觀察到的 `console.py` identify
+在 9600/LSE 下依然連不上（E5，60 秒前置等待也一樣）。這代表**問題不在
+時脈/鮑率本身能不能work，而在更高層的東西**（klippy 協定的封包/時序
+假設，或是 host 端在連續多位元組收發時的行為），本輪沒有再往下查，
+誠實記錄在第 6 節。
+
+### E0：host 端前置
+
+```
+$ sudo systemctl stop klipper
+$ sudo fuser -v /dev/ttyHS1
+（無輸出，exit code 1 —— 沒有任何程序占用）
+
+$ sudo stty -F /dev/ttyHS1 9600 raw -echo -crtscts cs8 -cstopb -parenb
+$ stty -F /dev/ttyHS1 -a | head -3
+speed 9600 baud; rows 0; columns 0; line = 0;
+intr = ^C; quit = ^\; erase = ^?; kill = ^U; eof = ^D; eol = <undef>;
+eol2 = <undef>; swtch = <undef>; start = ^Q; stop = ^S; susp = ^Z; rprnt = ^R;
+
+$ dmesg | grep -iE 'ttyHS1|geni|serial' | tail -20
+...
+[    3.155466] 4a88000.serial: ttyHS1 at MMIO 0x4a88000 (irq = 93, base_baud = 0) is a MSM
+...
+```
+
+`/dev/ttyHS1` 乾淨、`stty` 確認 `speed 9600` 生效。`dmesg` 顯示這個埠由
+Qualcomm 平台的 `msm_serial` 驅動（`4a88000.serial`）承載，driver 訊息
+裡沒有看到跟低鮑率相關的警告或限制字樣，但也沒有反面證據排除這個
+驅動對低鮑率有隱性限制——純粹是「沒看到異常訊息」，不是「確認沒有
+限制」。
+
+### E1/E2/E3：組態 H（HSI16，`CCIPR3=0x2`，`BRR=0x682AB`，對照組）
+
+**切換**（單一 openocd 呼叫，halt 內完成，模式同 part D 的 D2）：
+
+```
+0x46002400: 0000002d   ← 寫前
+0x46002400: 0000002c   ← 清 UE 後
+0x46020ce8: 00000002   ← CCIPR3 寫前（已是 HSI16，不變）
+0x46020ce8: 00000002   ← 讀回
+0x4600240c: 000682ab   ← BRR 寫入後讀回
+0x46002400: 0000002d   ← UE 設回後讀回
+```
+
+`256×16,000,000/9,600=426,666.67`，`DIV_ROUND_CLOSEST`後為 `426667=
+0x682AB`，跟讀回值一致。
+
+**E2 TX**（`timeout 6 cat /dev/ttyHS1 | od -An -tx1`，接著用 `mww` 把
+`0x55`/`0xA5` 寫進 `LPUART1_TDR`(`0x46002428`)）：
+
+```
+host 收到： 55 a5 0d 10 6a 32 81 e2 1e 84 9b 23 52 47 7e
+ISR（0x4600241C）= 0x00600090
+```
+
+前兩個位元組精確是 `55 a5`，**PASS**。`ISR=0x00600090`：bit4 `IDLE`=1、
+bit7 `TXE`=1、bit21 `TEACK`=1、bit22 `REACK`=1，無任何錯誤旗標。後面那
+串雜訊（`0d 10 6a...`）是 MCU 停止傳送後、線路處於 idle/浮動狀態時
+host 端接收器在 `timeout 6` 剩餘時間內收到的雜訊，不影響判讀。
+
+**E3 RX**（先用 `ICR`(`0x46002420`) 寫 `0x0000000F` 清 `PE/FE/NE/ORE`，
+確認 `ISR` 錯誤位清乾淨，再用 `printf '\x55' > /dev/ttyHS1` 送一個位元組，
+讀 `ISR`/`RDR`）：
+
+```
+清除後 ISR = 0x006000D0（PE/FE/NE/ORE 全 0，確認清乾淨）
+送出後 ISR = 0x006000F0，RDR(0x46002424) = 0x00000055
+```
+
+`ISR` bit5 `RXNE`=1、`FE`/`NE`/`ORE`=0，`RDR=0x55` 精確等於送出的
+位元組，**PASS**。
+
+（`LPUART1_ICR` 依 RM0456 §67.7.10，行 189581-189600，暫存器所有欄位
+存取型態只標 `w`，沒有 `r`，是 write-only 的 W1C（write-1-to-clear）
+語意，寫 `0` 的位元不受影響，不需要、也無法對它做傳統 RMW 讀回驗證；
+驗證改用讀之後的 `ISR` 是否真的清乾淨，已如上完成。）
+
+### E1/E2/E3：組態 L（LSE，`CCIPR3=0x3`，`BRR=0x36A`，受測組）
+
+切換前先確認 `RCC_BDCR=0x0C000883`（`LSESYSRDY` 仍是 1，延續 D1）：
+
+```
+0x46020cf0: 0c000883   ← 確認
+```
+
+**切換**：
+
+```
+0x46002400: 0000002d → 0000002c   ← 清 UE
+0x46020ce8: 00000002 → 00000003   ← CCIPR3 改 LSE
+0x4600240c: → 0000036a            ← BRR 寫入後讀回
+0x46002400: → 0000002d            ← UE 設回，讀回
+```
+
+**E2 TX**：
+
+```
+host 收到： 55 a5 0d 10 6a 32 81 e1 27 84 90 57 2b 11 7e
+ISR = 0x00600090
+```
+
+前兩個位元組同樣精確是 `55 a5`，`ISR` 狀態跟組態 H 完全一樣，**PASS**。
+
+**E3 RX**：
+
+```
+清除後 ISR = 0x006000D0
+送出後 ISR = 0x006000F0，RDR = 0x00000055
+```
+
+`RXNE=1`、`FE=0`、`RDR=0x55`，**PASS**。
+
+（兩次 E3 讀值之後的 `resume` 都回報 `Error: [stm32u5x.cpu] not
+halted`——這是因為上一個 openocd session 用 `shutdown` 結束連線時沒有
+明確 `resume`，CPU 在下一個 session 連上之前就已經自行恢復執行；`mdw`
+的讀值本身是在 CPU 仍處於 halt 狀態時完成的，不受這個訊息影響，讀值
+可信。）
+
+### E4：2x2 表
+
+|          | TX（MCU→host） | RX（host→MCU） |
+|---|---|---|
+| **H（HSI16）** | **PASS**（收到 `55 a5`，ISR 無錯誤） | **PASS**（`RXNE=1`、`RDR=0x55`、無錯誤旗標） |
+| **L（LSE）**   | **PASS**（收到 `55 a5`，ISR 無錯誤） | **PASS**（`RXNE=1`、`RDR=0x55`、無錯誤旗標） |
+
+### E5：L 列兩格都 PASS，依規則重跑 identify（60 秒前置等待）
+
+```
+$ (sleep 60; echo get_uptime; sleep 3) | timeout 75 \
+    ~/klippy-env/bin/python3 ~/klipper/klippy/console.py -b 9600 /dev/ttyHS1
+...
+INFO:root:Timeout on connect
+ERROR:root:Wait for identify_response
+...
+serialhdl.error: Serial connection closed
+（反覆逾時，75 秒視窗內從未 connected，identify 從未完成）
+```
+
+**依然 FAIL。** 前置等待從 30 秒拉長到 60 秒（總視窗 75 秒）沒有改變
+結果——這排除了「單純連線建立時序太趕」這個簡單假設。
+
+### E6：還原
+
+```
+$ sudo openocd ... -c "reset run" -c "sleep 2000" -c "halt" \
+    -c "mdw 0x4600240C" -c "mdw 0x46020CE8" -c "resume" -c "shutdown"
+0x4600240c: 00004000
+0x46020ce8: 00000002
+
+$ sudo systemctl start klipper && sleep 20 && curl -s http://localhost:7125/printer/info
+{"result":{"state":"ready", ...}}
+{'bytes_retransmit': 0, 'bytes_invalid': 0, 'send_seq': 135, 'receive_seq': 135, 'srtt': 0.002, ...}
+```
+
+`BRR`/`CCIPR3` 回到 D0/part B 的原值，`state=ready`、
+`bytes_retransmit=0`、`bytes_invalid=0` 全部確認。
+
+### Part E 判讀
+
+**暫存器層級的單位元組收發，在 HSI16 跟 LSE 兩種時脈來源下都完全正常，
+沒有任何鮑率誤差或錯誤旗標的跡象**——這直接排除了「LSE 這個時脈源
+本身跑不動 9600」或「BRR 算錯」這類最直接的假設。但 klippy 的
+`console.py` identify 協定在 LSE/9600 下始終連不上，**即使把連線視窗拉到
+75 秒也一樣**。兩者放在一起看，問題的位置被縮小到：**不是時脈/鮑率
+本身，而是 identify 這個多位元組、雙向、有時序假設的協定跑在 LSE/9600
+這個組合下時出了問題**——但具體是協定裡的哪個環節（連續位元組間的
+timing、host 端在收到單一位元組 vs. 連續 framed 封包時行為不同、還是
+別的原因），本輪沒有再往下拆解，記在第 6 節。
+
+---
+
+## 6. 我無法判定的事
 
 1. **A1 的 HSIKERON 疑問**：`LPUART1SEL` 的 RM 註解沒有像 `LPTIM1SEL`/
    `LPTIM34SEL` 那樣要求「HSI16 with HSIKERON=1」，本文件推論是因為
@@ -537,14 +716,18 @@ $ curl -s "http://localhost:7125/printer/objects/query?mcu" | ...
    本身能不能起振」，沒有把 LPUART1 接上 LSE；這件事後來在 part D
    （第 4 節）做了，也做了 `LSESYSEN`→`LSESYSRDY` 那一步，結果是
    **9600 baud 端到端連線失敗**，細節見第 4 節。
-7. ★ **D3 為什麼 9600/LSE 連不上，根本原因本輪沒有查**。已知的事實只有：
-   SWD 讀回證實 `CR1`/`CCIPR3`/`BRR` 三個暫存器都精確落在計算值、
-   `LSESYSRDY=1`、MCU 沒有重置（暫存器值全程沒變）——照 RM0456 字面
-   的設定步驟看起來都做對了，但實際收發就是建立不起來。沒有做的診斷
-   包括：（a）沒有用示波器/邏輯分析儀看 `/dev/ttyHS1` 對應接腳在切換
-   後有沒有真的輸出 9600 baud 的訊號；（b）沒有查 host 端（Qualcomm
-   side）`/dev/ttyHS1` 這個 High-Speed UART 介面的驅動是否對超低鮑率
-   有限制；（c）沒有嘗試過中間鮑率（例如先切到 38400 這種 HSI16 也能跑
-   但比較低的鮑率）來縮小「是 LSE 本身的問題」還是「是鮑率太低本身的
-   問題」這兩個假設的範圍。這些都留給下一輪，本輪只如實記錄「照 RM
-   設定但連不上」這個事實，不猜測根因。
+7. ~~D3 為什麼 9600/LSE 連不上，根本原因本輪沒有查~~ ★ **已被 part E
+   部分縮小範圍，但仍未找到根因**。part E 的 2x2 矩陣證實：單一位元組
+   在 HSI16 跟 LSE 兩種時脈下，TX/RX 在暫存器層級都完全正常（無錯誤
+   旗標、位元組內容精確吻合），這排除了「LSE 本身送不出/收不到訊號」
+   這個最簡單的假設，也間接排除了需要示波器才能看到的「完全沒有訊號」
+   這種情況（host 端 `cat`/`printf` 這種純軟體層級的收發都已經能正確
+   運作，不需要再用示波器確認實體訊號存在）。但 identify 協定（多
+   位元組、雙向、有時序/重傳假設）在同一個 9600/LSE 組合下還是連不上，
+   即使把連線視窗拉到 75 秒也一樣。本輪**沒有**做的事：（a）沒有嘗試
+   中間鮑率（例如 HSI16 clocked 的 38400 baud）去確認問題是「鮑率本身
+   偏低」還是「LSE 這個時脈源特有」；（b）沒有用邏輯分析儀比對 HSI16
+   跟 LSE 兩種時脈下，連續多位元組（不是單一位元組）傳輸時的位元邊沿
+   時序是否有差異；（c）沒有讀 `klippy/serialhdl.py`／`console.py` 原始碼
+   確認 identify 協定本身對逐位元組延遲、封包間隔有沒有寫死的假設，
+   跟 9600 baud 下遠比 250000 baud 長的位元時間是否衝突。這些留給下一輪。

@@ -49,6 +49,11 @@
 // 跑到底，SYSCLK 最差就是停在切換前的來源，不會卡在半設定狀態）。
 uint32_t stm32u5_sysclk_bringup(void);
 
+/* 2B G1b：Step 0-3 各自完成瞬間的 DWT->CYCCNT 快照，寫在
+ * stm32u5_sysclk_bringup() 內（stm32u5.c），這裡只是 extern 讀取，
+ * 同樣比照上面 stm32u5_sysclk_bringup() 的前置宣告作法。 */
+extern volatile uint32_t stm32u5_bringup_mark[4];
+
 /* ===== RCC / PWR：LSI + LPTIM1 喚醒源、SYSCLK 驗證（RM0456 Rev4） ===== */
 #define U5_RCC_BASE       0x46020C00UL
 #define U5_PWR_BASE       0x46020800UL
@@ -112,6 +117,17 @@ struct stop2_status {
     uint32_t restore_timeout;  /* stm32u5_sysclk_restore() 內任一段忙等逾時 */
     uint32_t lptim_timeout;    /* LPTIM1 DIEROK/ARROK 輪詢逾時 */
     uint32_t entry_fail;       /* 進入 Stop2 前 PWR_CR1/SCB_SCR 寫入讀回驗證失敗 */
+    /* 2B G1b：喚醒延遲分段遙測，DWT->CYCCNT 差值。entry_fail 路徑
+     * （從未進 wfi）五段固定回報 0，不代表量測值。
+     *   s0：wfi 醒來（isb 後，MSIS）→ Step 0 完成（SWS=HSI16）
+     *   s1：Step 1 完成 − Step 0 完成（VOS Range1 + EPOD booster）
+     *   s2：Step 2 完成 − Step 1 完成（Flash 4WS）
+     *   s3：Step 3 完成 − Step 2 完成（PLL1 鎖定）
+     *   s4：restore 完成 − Step 3 完成（SW=PLL1R 切換 + 等待）
+     * s0 全程橫跨 MSIS→HSI16 切換點，s1-s4 全程在 HSI16 上（s4 最後
+     * 一刻切到 PLL1R，但切換動作本身只佔極少數 cycle，換算時仍按
+     * HSI16 概算，見文件換算段的說明）。 */
+    uint32_t s0, s1, s2, s3, s4;
 };
 static struct stop2_status s_status;
 
@@ -224,9 +240,11 @@ uint32_t stm32u5_sysclk_restore(void)
 
 /* 收集一次 Stop2 進出的診斷快照。sws/pll1rdy/pwr_cr1/scb_scr 是單純
  * 暫存器讀取、無副作用，四個退出路徑都呼叫這支也不會互相干擾。 */
+static const uint32_t s_zero_seg[5];  /* 全 0，entry_fail 路徑共用 */
+
 static void
 stop2_capture_status(uint32_t entry_fail, uint32_t restore_timeout,
-                      uint32_t lptim_timeout)
+                      uint32_t lptim_timeout, const uint32_t *seg)
 {
     s_status.sws             = (U5_RCC_CFGR1 >> 2) & 3u;
     s_status.pll1rdy         = (U5_RCC_CR >> 25) & 1u;
@@ -235,6 +253,8 @@ stop2_capture_status(uint32_t entry_fail, uint32_t restore_timeout,
     s_status.restore_timeout = restore_timeout;
     s_status.lptim_timeout   = lptim_timeout;
     s_status.entry_fail      = entry_fail;
+    s_status.s0 = seg[0]; s_status.s1 = seg[1]; s_status.s2 = seg[2];
+    s_status.s3 = seg[3]; s_status.s4 = seg[4];
 }
 
 /* ===== Milestone 2A：Stop2 進出一次 =====
@@ -255,6 +275,7 @@ void stop2_once(void)
     uint32_t sysstate, scr, cr1;
     uint32_t lptim_timeout = 0;
     uint32_t restore_timeout;
+    uint32_t c0 = 0, c1 = 0;   /* 2B G：喚醒延遲遙測，DWT->CYCCNT 快照 */
 
     irq_disable();
 
@@ -317,7 +338,7 @@ void stop2_once(void)
     if ((U5_PWR_CR1 & 7u) != 0x02u) {
         SYSTICK_CTRL = sysstate;
         U5_LPTIM1_CR = 0;
-        stop2_capture_status(1, 0, lptim_timeout);
+        stop2_capture_status(1, 0, lptim_timeout, s_zero_seg);
         led3_red(1);
         irq_enable();
         return;
@@ -329,7 +350,7 @@ void stop2_once(void)
         U5_PWR_CR1 &= ~7u;
         SYSTICK_CTRL = sysstate;
         U5_LPTIM1_CR = 0;
-        stop2_capture_status(1, 0, lptim_timeout);
+        stop2_capture_status(1, 0, lptim_timeout, s_zero_seg);
         led3_red(1);
         irq_enable();
         return;
@@ -346,6 +367,7 @@ void stop2_once(void)
     __asm volatile ("dsb" ::: "memory");
     __asm volatile ("wfi");
     __asm volatile ("isb" ::: "memory");
+    c0 = DWT->CYCCNT;       /* 2B G：wfi 醒來瞬間的 cycle 快照，喚醒時脈下計數 */
     IWDG->KR = 0xAAAA;     /* 醒來立刻餵，在 sysclk_restore() 之前 */
 
     /* 醒來的第一件事永遠是拆除 SLEEPDEEP/LPMS，而不是先做時鐘還原。
@@ -361,6 +383,7 @@ void stop2_once(void)
      * s_status.sws 才是「結果到底對不對」的直接證據——兩者都要看，
      * 純看 LED3_R 有沒有閃根本分不出這裡的問題（見問題 1 的說明）。 */
     restore_timeout = stm32u5_sysclk_restore();
+    c1 = DWT->CYCCNT;        /* 2B G：restore 完成瞬間的 cycle 快照 */
 
     SCB_ICSR = (1u << 25);
     SYSTICK_CTRL = sysstate;
@@ -371,7 +394,16 @@ void stop2_once(void)
 
     irq_enable();
 
-    stop2_capture_status(0, restore_timeout, lptim_timeout);
+    {
+        /* 2B G1b：拆成 Step 0-4 五段，見 struct stop2_status 的欄位註解。 */
+        uint32_t seg[5];
+        seg[0] = stm32u5_bringup_mark[0] - c0;
+        seg[1] = stm32u5_bringup_mark[1] - stm32u5_bringup_mark[0];
+        seg[2] = stm32u5_bringup_mark[2] - stm32u5_bringup_mark[1];
+        seg[3] = stm32u5_bringup_mark[3] - stm32u5_bringup_mark[2];
+        seg[4] = c1 - stm32u5_bringup_mark[3];
+        stop2_capture_status(0, restore_timeout, lptim_timeout, seg);
+    }
 
     /* 三色狀態燈——這裡是唯一能分辨「看起來醒了但其實只是慢了 40 倍」
      * 的地方（LPTIM1 掛在 LSI 上，跟 SYSCLK 是否鎖回 PLL1 完全無關，
@@ -404,12 +436,24 @@ command_test_stop2(uint32_t *args)
 {
     uint32_t period_ms = args[0];
     uint32_t cycles = args[1];
-    uint32_t n;
+    uint32_t n, k;
+    /* 2B G1b：喚醒延遲分段遙測，跨整輪 cycles 累積，結束時各段的
+     * max/sum 分兩則 sendf 送出（單則訊息避免超過 64-byte 上限），
+     * 不動既有 stop2_status 的每輪回報格式。entry_fail 的輪次
+     * （從未進 wfi）不計入聚合。 */
+    uint32_t agg_n = 0;
+    uint32_t seg_max[5] = {0, 0, 0, 0, 0};
+    uint32_t seg_sum[5] = {0, 0, 0, 0, 0};
 
     if (period_ms == 0 || period_ms > 2000)
         period_ms = 2000;              /* LPTIM1 ARR 16bit/32kHz 上限 */
     if (cycles == 0 || cycles > 200)
         cycles = 5;
+
+    /* DWT->CYCCNT 本檔案之前刻意不用（見檔頭註解），2B G 開始才需要，
+     * 只在這裡啟用一次，不影響 stop2_once() 內既有時序。 */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     led3_init();
     lptim1_wakeup_init(period_ms);
@@ -427,6 +471,18 @@ command_test_stop2(uint32_t *args)
               , s_status.restore_timeout, s_status.lptim_timeout
               , s_status.entry_fail);
 
+        if (!s_status.entry_fail) {
+            uint32_t seg[5];
+            seg[0] = s_status.s0; seg[1] = s_status.s1; seg[2] = s_status.s2;
+            seg[3] = s_status.s3; seg[4] = s_status.s4;
+            for (k = 0; k < 5; k++) {
+                if (seg[k] > seg_max[k])
+                    seg_max[k] = seg[k];
+                seg_sum[k] += seg[k];
+            }
+            agg_n++;
+        }
+
         /* restore_timeout 或 SWS 不是 PLL1R：終止態，中止後續 cycles，
          * 讓 LED3_B/G 維持點亮供離線判讀。entry_fail 不中止——維持
          * 原本的快速閃爍診斷（見 stop2_once() 內註解）。 */
@@ -437,5 +493,12 @@ command_test_stop2(uint32_t *args)
          * 這段時間不算進 LPTIM1 的睡眠週期，只是純視覺用途。 */
         busy_delay(2000000);
     }
+
+    sendf("stop2_lat_max n=%u s0=%u s1=%u s2=%u s3=%u s4=%u"
+          , agg_n, seg_max[0], seg_max[1], seg_max[2], seg_max[3]
+          , seg_max[4]);
+    sendf("stop2_lat_sum n=%u s0=%u s1=%u s2=%u s3=%u s4=%u"
+          , agg_n, seg_sum[0], seg_sum[1], seg_sum[2], seg_sum[3]
+          , seg_sum[4]);
 }
 DECL_COMMAND(command_test_stop2, "test_stop2 period_ms=%u cycles=%u");

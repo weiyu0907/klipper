@@ -1,5 +1,6 @@
 #include "autoconf.h"
 #include <stdint.h>
+#include "internal.h"   // DWT (2B G1b：喚醒延遲分段遙測，CYCCNT 快照)
 
 /* ===== STM32U585 RCC / PWR bare-metal registers (RM0456 Rev4) ===== */
 #define U5_RCC_BASE     0x46020C00UL
@@ -149,6 +150,14 @@ static void stm32u5_hsi48_init(void)
               |  (1u << 6);             /* CEN */
 }
 
+/* 2B G1b：Stop2 喚醒延遲分段遙測。冷開機路徑（stm32_clock_init()）也會
+ * 跑同一份 stm32u5_sysclk_bringup()、也會寫這四個快照，但冷開機路徑
+ * 沒有人讀它們（stop2_once() 才會用），純屬無害的多餘寫入，不需要
+ * 額外的旗標去區分兩條路徑。非 static：extern 給 stm32u5_lowpower.c
+ * 用，比照該檔既有對 stm32u5_sysclk_bringup() 前置宣告的作法，不另開
+ * 共用標頭。 */
+volatile uint32_t stm32u5_bringup_mark[4];
+
 /* Step 0-4：HSI16 起振 → VOS1+EPOD → Flash 4WS → PLL1 160MHz → SW=PLL1R。
  * 冷開機 stm32_clock_init() 與 Stop2 喚醒 stm32u5_sysclk_restore()
  * （見 stm32u5_lowpower.c）共用同一份序列：Stop2 只關閉 PLL1、切回
@@ -186,15 +195,19 @@ uint32_t stm32u5_sysclk_bringup(void)
     }
     if (i >= U5_WAIT_LOOPS)
         timeout = 1;
+    stm32u5_bringup_mark[0] = DWT->CYCCNT;   /* 2B G1b: Step 0 完成 */
 
     /* Step 1: VOS Range 1 + EPOD booster (prerequisite for 160 MHz) */
     timeout |= stm32u5_voltage_scale1();
+    stm32u5_bringup_mark[1] = DWT->CYCCNT;   /* 2B G1b: Step 1 完成 */
 
     /* Step 2: Flash latency 4WS (160 MHz @ VOS1) */
     timeout |= stm32u5_flash_latency_set(4);
+    stm32u5_bringup_mark[2] = DWT->CYCCNT;   /* 2B G1b: Step 2 完成 */
 
     /* Step 3: PLL1 → 160 MHz */
     timeout |= stm32u5_pll1_init();
+    stm32u5_bringup_mark[3] = DWT->CYCCNT;   /* 2B G1b: Step 3 完成 */
 
     /* Step 4: switch SYSCLK → PLL1R */
     U5_RCC_CFGR1 = (U5_RCC_CFGR1 & ~3u) | 3u;          /* SW = PLL1R */

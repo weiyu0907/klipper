@@ -686,7 +686,233 @@ timing、host 端在收到單一位元組 vs. 連續 framed 封包時行為不�
 
 ---
 
-## 6. 我無法判定的事
+## 6. Part F：驗證 identify 失敗是 `serialhdl` 的 5 秒連線逾時 —— ★ 根因確認
+
+延續 part E 的懸念：2x2 矩陣全 PASS，但 identify 協定仍連不上。本節直接
+查 `serialhdl.py` 原始碼、算出理論耗時、用一份**repo 外**、只改一個數字
+的副本重跑，實測結果與預測吻合、且原版逾時可重現——**根因是
+identify 交握本身在 9600 baud 下就是需要 >5 秒，而 `serialhdl.py` 把
+單次連線嘗試的逾時寫死在 5 秒，逾時後整個 identify 從 offset 0 重來，
+不管重試幾次、總預算給多少秒，只要單次嘗試撐不過 5 秒就永遠連不上。**
+不是時脈/協定本身壞掉（part E 已證明位元組層級完全正常），純粹是這份
+測試工具（`console.py`/`serialhdl.py`）的逾時常數配不上 9600 baud 而已。
+
+### F1：查證 `serialhdl.py`（純讀）
+
+```
+$ grep -n "completion.wait" ~/klipper/klippy/serialhdl.py
+99:        identify_data = completion.wait(self.reactor.monotonic() + 5.)
+263:        params = completion.wait()
+
+$ grep -n "Timeout on connect" ~/klipper/klippy/serialhdl.py
+101:            logging.info("%sTimeout on connect", self.warn_prefix)
+```
+
+`_start_session()`（行 88-107）第 99 行：**5 秒**逾時。逾時後（行
+100-103）：
+
+```python
+if identify_data is None:
+    logging.info("%sTimeout on connect", self.warn_prefix)
+    self.disconnect()
+    return False
+```
+
+`_get_identify_data()`（行 70-84）本身是個迴圈，靠累積 `identify offset=%d
+count=40` 的回應組出完整字典，`identify_data = b""` 在函式開頭初始化——
+**每次被呼叫都是從 offset 0 重新開始**，沒有跨呼叫的斷點續傳。
+
+外層 `connect_uart()`（行 187-206）：
+
+```python
+start_time = self.reactor.monotonic()
+while 1:
+    if self.reactor.monotonic() > start_time + 90.:
+        self._error("Unable to connect")
+    ...
+    ret = self._start_session(serial_dev)
+    if ret:
+        break
+```
+
+確認：**逾時後會 `disconnect()`、`_start_session` 回傳 `False`，外層
+`while` 迴圈重開一次 serial port、再呼叫一次 `_start_session()`，等於
+identify 真的是從 offset 0 整個重來**，這個 90 秒是「重試幾次」的總
+預算，不是單次識別的逾時——單次識別永遠只有 5 秒。
+
+### F2：事前預測（純計算）
+
+```
+$ cd ~/klipper && ls -la out/klipper.dict
+-rw-rw-r-- 1 arduino arduino 9089  9月 20 14:54 out/klipper.dict
+
+$ python3 -c "import json; d=json.load(open('out/klipper.dict')); print(d.get('version'))"
+v0.13.0-474-ge9985ad22
+```
+
+`out/klipper.dict` 的版本跟現役韌體（`v0.13.0-474-ge9985ad22`）完全一致，
+不需要改從 `klippy.log` 估。
+
+```
+$ python3 -c "import zlib;d=open('out/klipper.dict','rb').read();print(len(d),len(zlib.compress(d,9)))"
+9089 3275
+```
+
+原始 9089 bytes，`zlib` 等級 9 壓縮後 3275 bytes。
+
+```
+chunks = ceil(3275/40) = 82
+predicted = 82 × 0.065s = 5.330s
+```
+
+**預測值 5.330 秒，已經比 5 秒逾時常數還長**——理論上就該連不上，
+這個預測本身已經支持「5 秒逾時太短」的假設，F3-F5 用實測驗證。
+
+### F3：repo 外放寬逾時的副本
+
+```
+$ rm -rf ~/klippy_f3 && cp -r ~/klipper/klippy ~/klippy_f3
+$ sed -i 's/completion.wait(self.reactor.monotonic() + 5\.)/completion.wait(self.reactor.monotonic() + 60.)/' ~/klippy_f3/serialhdl.py
+$ grep -n "completion.wait" ~/klippy_f3/serialhdl.py
+99:        identify_data = completion.wait(self.reactor.monotonic() + 60.)
+263:        params = completion.wait()
+```
+
+`sed` 精確命中一行，改成 `60.`；第 263 行（另一個無逾時參數的
+`completion.wait()`）沒被動到。確認原版 `~/klipper/klippy/serialhdl.py`
+沒有受影響（仍是 `5.`）。`~/klippy_f3` 在 repo 之外，不會進版控。
+
+### F4（背景執行失誤，已用 F4b 取代）
+
+第一次 F4 用 `run_in_background` 執行，且 stdin 腳本結束後 `console.py`
+本身不會自動退出（沒加外層 `timeout`），導致這個背景 shell 卡了超過
+9.8 小時才被人工發現、`pkill -f klippy_f3/console.py` 手動終止。這是
+**指令設計的失誤，不是待測系統的行為**，記錄下來但不當作正式結果：
+
+```
+$ pkill -f klippy_f3/console.py
+$ pgrep -af console.py   # 無輸出，確認沒有殘留
+```
+
+`~/f4_console.log`（無時間戳版本，僅供佐證）：`Timeout on connect`
+出現 **0 次**、`connected` 出現 **1 次**、`get_uptime` 有回應
+（`070.003: uptime high=24 clock=809090595`）——**第一次嘗試就成功**，
+方向上已經支持假設，F4b 補上精確計時。
+
+### F4b：前景、帶時間戳、加 `timeout` 重跑（正式結果）
+
+切換前確認 MCU 仍在組態 L：`CCIPR3=0x00000003`、`BRR=0x0000036A`，
+符合，繼續。
+
+```
+$ date +%s.%N > ~/f4b_start.txt   # 1790037942.970364397
+$ (sleep 90; echo get_uptime; sleep 3; echo get_clock; sleep 3) | timeout 110 \
+    ~/klippy-env/bin/python3 ~/klippy_f3/console.py -b 9600 /dev/ttyHS1 2>&1 \
+    | while IFS= read -r l; do printf "%s %s\n" "$(date +%s.%N)" "$l"; done | tee ~/f4b_console.log
+```
+
+關鍵時間戳：
+
+```
+1790037944.163727209 ==================== attempting to connect ====================
+1790037951.193652831 Loaded 131 commands (v0.13.0-474-ge9985ad22 / ...)
+1790037951.982199497 ====================       connected       ====================
+1790038033.032808373 088.973: uptime high=1343 clock=2360888118
+```
+
+```
+identify 耗時 = connected − attempting to connect
+             = 1790037951.982199497 − 1790037944.163727209
+             = 7.818 秒
+```
+
+**實測 7.818 秒，比 F2 預測的 5.330 秒多約 47%**（`chunks`/固定開銷估算
+本身是粗估，沒有算進每個 request-response 往返的 host-MCU 排程延遲），
+但同一個數量級，且**兩者都遠超過 5 秒逾時常數**，方向完全一致。
+`Timeout on connect` 出現 **0 次**——放寬逾時後第一次嘗試就直接成功，
+`get_uptime` 有正確回應（`uptime high=1343 clock=2360888118`）。
+
+（`get_clock` 的回應沒有被這次 `timeout 110` 的視窗完整捕捉到——
+stdin 腳本本身需要 `sleep90+sleep3+sleep3=96` 秒外加約 8 秒的 identify
+耗時，逼近 110 秒視窗上限，log 在收到 `get_uptime` 回應後不久就被外層
+`timeout` 切斷。不影響「identify 成功、雙向通訊正常」這個結論，
+`get_uptime` 本身已經是一次完整的雙向往返。）
+
+### F5：對照組（原版 `console.py`，5 秒逾時）
+
+```
+$ date +%s.%N > ~/f5_start.txt   # 1790038090.393523038
+$ (sleep 90; echo get_uptime; sleep 3; echo get_clock; sleep 3) | timeout 110 \
+    ~/klippy-env/bin/python3 ~/klipper/klippy/console.py -b 9600 /dev/ttyHS1 2>&1 \
+    | while IFS= read -r l; do printf "%s %s\n" "$(date +%s.%N)" "$l"; done | tee ~/f5_console.log
+```
+
+```
+1790038091.135532725 ==================== attempting to connect ====================
+1790038096.069490067 INFO:root:Timeout on connect          ← 約 4.93 秒後，符合 5 秒逾時
+1790038101.089613867 INFO:root:Timeout on connect          ← 再約 5.02 秒後，第二次逾時
+1790038102.199594232 KeyError: ('identify_response', None)  ← 未預期的例外，程序崩潰
+```
+
+`Timeout on connect` 出現 **2 次**，間隔精準對應 5 秒逾時常數
+（4.93s、5.02s）。第二次逾時後緊接著一個 `serialhdl.py` 既有的
+競態問題（第二次 identify 請求的 response handler 在清理時撞上
+`KeyError: ('identify_response', None)`，導致整個 Python 程序未捕捉
+例外而崩潰，沒能撐到原本 90 秒的總重試預算）——**這是一個附帶發現
+的既有 bug，不在本次任務範圍內**，只如實記錄，不深入除錯。不論有沒有
+這個崩潰，`Timeout on connect` 已經重現兩次，跟 part D/E 觀察到的現象
+一致。
+
+### F6：還原
+
+```
+$ sudo openocd ... -c "reset run" -c "sleep 2000" -c "halt" \
+    -c "mdw 0x4600240C" -c "mdw 0x46020CE8" -c "resume" -c "shutdown"
+0x4600240c: 00004000
+0x46020ce8: 00000002
+
+$ sudo systemctl start klipper && sleep 20 && curl -s http://localhost:7125/printer/info
+{"result":{"state":"ready", ...}}
+{'bytes_retransmit': 0, 'bytes_invalid': 0, 'send_seq': 137, 'receive_seq': 137, 'srtt': 0.002, ...}
+```
+
+`BRR`/`CCIPR3` 回到原值，`state=ready`、`bytes_retransmit=0`、
+`bytes_invalid=0` 全部確認。`~/klippy_f3` 留在板子上（不進 repo），
+`~/klipper/klippy/serialhdl.py`（原版）全程未被修改。
+
+### Part F 結論：預測 vs 實測
+
+| | 數值 |
+|---|---|
+| F2 預測 identify 耗時 | 5.330 秒 |
+| F4b 實測 identify 耗時（60 秒逾時） | 7.818 秒 |
+| `serialhdl.py` 硬編碼逾時 | 5.000 秒 |
+| F4b：`Timeout on connect` 次數 | 0（放寬逾時後） |
+| F5：`Timeout on connect` 次數 | 2（原版逾時，符合預期） |
+
+**★ 這個失敗是測試方法（在 9600 baud 下重新 identify）造成的，不是
+LPUART/LSE 硬體或協定本身的限制**：identify 需要傳輸完整的資料字典
+（壓縮後 3275 bytes），在 9600 baud 這個鮑率下，光是這個一次性的資料
+傳輸就需要 7-8 秒，天生就比 `serialhdl.py` 寫死的 5 秒連線逾時長。
+part E 已經證明位元組層級的收發在 9600/LSE 下完全正常，part F 進一步
+證明只要把逾時放寬到 identify 實際需要的時間，**identify 協定本身在
+9600/LSE 下也完全正常，一次就成功，沒有任何重試**。
+
+**★ 這個限制不適用於正式的 2B 方案 (b) 設計**：方案 (b) 的設計是
+「identify 在 250000 baud 完成後，才動態切到 LSE/9600 baud 維持 Stop2
+低功耗待機」——也就是說，identify 這個需要傳輸完整字典的重量級交握，
+在正式設計裡**從頭到尾都在 250000 baud 下完成**（跟 part A-part D 都
+測過的 250000 baud identify 完全一樣，早就驗證過沒問題），MCU 只有在
+identify 完成、klippy 已經建立好連線之後，才會切到 LSE/9600（這時候
+klippy 端不需要再重新 identify，只是維持既有連線的 keep-alive/喚醒
+訊號）。本輪 part D/E/F 測試的「MCU 一開機就在 9600/LSE 下直接 identify」
+是**刻意設計的壓力測試場景**，用來隔離變數（單獨測 LSE 這個時脈源本身
+能不能在最極端的情況下工作），不是方案 (b) 實際會遇到的使用情境，
+兩者不能混為一談。
+
+---
+
+## 7. 我無法判定的事
 
 1. **A1 的 HSIKERON 疑問**：`LPUART1SEL` 的 RM 註解沒有像 `LPTIM1SEL`/
    `LPTIM34SEL` 那樣要求「HSI16 with HSIKERON=1」，本文件推論是因為
@@ -716,18 +942,23 @@ timing、host 端在收到單一位元組 vs. 連續 framed 封包時行為不�
    本身能不能起振」，沒有把 LPUART1 接上 LSE；這件事後來在 part D
    （第 4 節）做了，也做了 `LSESYSEN`→`LSESYSRDY` 那一步，結果是
    **9600 baud 端到端連線失敗**，細節見第 4 節。
-7. ~~D3 為什麼 9600/LSE 連不上，根本原因本輪沒有查~~ ★ **已被 part E
-   部分縮小範圍，但仍未找到根因**。part E 的 2x2 矩陣證實：單一位元組
-   在 HSI16 跟 LSE 兩種時脈下，TX/RX 在暫存器層級都完全正常（無錯誤
-   旗標、位元組內容精確吻合），這排除了「LSE 本身送不出/收不到訊號」
-   這個最簡單的假設，也間接排除了需要示波器才能看到的「完全沒有訊號」
-   這種情況（host 端 `cat`/`printf` 這種純軟體層級的收發都已經能正確
-   運作，不需要再用示波器確認實體訊號存在）。但 identify 協定（多
-   位元組、雙向、有時序/重傳假設）在同一個 9600/LSE 組合下還是連不上，
-   即使把連線視窗拉到 75 秒也一樣。本輪**沒有**做的事：（a）沒有嘗試
-   中間鮑率（例如 HSI16 clocked 的 38400 baud）去確認問題是「鮑率本身
-   偏低」還是「LSE 這個時脈源特有」；（b）沒有用邏輯分析儀比對 HSI16
-   跟 LSE 兩種時脈下，連續多位元組（不是單一位元組）傳輸時的位元邊沿
-   時序是否有差異；（c）沒有讀 `klippy/serialhdl.py`／`console.py` 原始碼
-   確認 identify 協定本身對逐位元組延遲、封包間隔有沒有寫死的假設，
-   跟 9600 baud 下遠比 250000 baud 長的位元時間是否衝突。這些留給下一輪。
+7. ~~D3 為什麼 9600/LSE 連不上，根本原因本輪沒有查~~ ~~已被 part E
+   部分縮小範圍，但仍未找到根因~~ ★★ **已在 part F 找到根因並用實測
+   驗證**：`serialhdl.py` 把 identify 單次連線逾時寫死在 5 秒
+   （`serialhdl.py:99`），而 9600 baud 下傳完整字典（壓縮後 3275
+   bytes）本身就需要約 7.8 秒，天生就比 5 秒逾時常數長，導致每次嘗試
+   都必然逾時、且逾時後從 offset 0 重來，不管重試幾次都連不上。把逾時
+   放寬到 60 秒（僅在 repo 外的 `~/klippy_f3` 副本上，未改動任何
+   repo 內檔案）後，identify 第一次嘗試就成功，`Timeout on connect`
+   出現 0 次；用原版（5 秒逾時）重跑則重現 `Timeout on connect` 2 次。
+   詳見 part F。part E 提到的（a）（b）（c）三個延伸診斷方向因為根因
+   已經確認，不再需要繼續追。
+8. ★ **F5 意外發現的 `serialhdl.py` 既有 bug**：第二次 identify 逾時後，
+   `register_response` 清理 handler 時觸發
+   `KeyError: ('identify_response', None)`，整個 Python 程序未捕捉例外
+   崩潰，沒能撐滿原本 90 秒的重試預算。這看起來是連續兩次快速逾時之間
+   的一個競態（第一次逾時的清理跟第二次請求的註冊時序重疊），但本輪
+   只在 F5 這一次觀察到，沒有嘗試重現或深入追查，不確定是否每次「連續
+   兩次 5 秒內逾時」都會觸發，還是這次剛好撞上的特例；也不確定這個 bug
+   是否只在 9600 這種逾時密集重試的場景才會暴露，正常 250000 baud
+   下幾乎不會連續逾時兩次，可能是這個 bug 至今沒被注意到的原因。

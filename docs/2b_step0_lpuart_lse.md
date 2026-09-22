@@ -404,6 +404,14 @@ mww 0x46020CF0 0x0C000083
 `LSESYSRDY` 在 32.768kHz 下只需要 2 個 LSE 時脈週期（約 61µs），遠快於
 SWD 往返一次的時間，5 秒的 poll 視窗完全用不到。
 
+★ **這裡只驗證了「`LSESYSEN` 有設，LPUART1 用 LSE 就能運作」，沒有做
+對照組去驗證「`LSESYSEN` 不設，LPUART1 用 LSE 會失敗」**——part D/E/F
+全程都是在 `LSESYSEN=1` 的前提下測的，沒有反過來刻意清掉 `LSESYSEN`
+再重跑一次 E2/E3 這種位元組層級測試去確認它真的是必要條件（而不是
+「設了沒差，剛好都會動」）。RM0456 的文字（行 33298-33320）明確要求
+這個步驟，但本輪的實測沒有單獨隔離驗證它的必要性，這是「文件說要做」
+與「實測證明真的需要」之間還沒補上的一塊。
+
 ### D2：切換（單一 openocd 呼叫，halt 狀態內完成）
 
 ```
@@ -832,6 +840,23 @@ identify 耗時 = connected − attempting to connect
 `Timeout on connect` 出現 **0 次**——放寬逾時後第一次嘗試就直接成功，
 `get_uptime` 有正確回應（`uptime high=1343 clock=2360888118`）。
 
+用實測總時間反推每個 chunk 的實際耗時：
+
+```
+82 chunks / 7.818s = 95.3 ms/chunk（實測）
+F2 預測：65 ms/chunk（0.065s 這個常數的來源）
+差額：95.3 − 65 = 30.3 ms/chunk（約多 47%）
+```
+
+★ **這個每 chunk 多出來的約 30ms 差額，本輪沒有拆解成因**。可能的
+組成包含（但本輪都沒有分別量測）：單一 `identify` request/response
+往返本身的封包開銷（不只是 40 bytes 資料的傳輸時間，還有 request 封包
+本身、CRC、ack 等額外位元組）、host 端（`reactor.py` 事件迴圈）處理
+每個回應的排程延遲、9600 baud 下每個位元組較長的實際傳輸時間跟
+`0.065s` 這個常數本身的假設（是否已經包含了封包開銷）是否一致。
+`0.065s` 這個數字的原始推導本身也不在本輪查證範圍內（是任務給定的
+常數，不是本輪從協定細節推出來的），差額只如實記錄，不猜測成因。
+
 （`get_clock` 的回應沒有被這次 `timeout 110` 的視窗完整捕捉到——
 stdin 腳本本身需要 `sleep90+sleep3+sleep3=96` 秒外加約 8 秒的 identify
 耗時，逼近 110 秒視窗上限，log 在收到 `get_uptime` 回應後不久就被外層
@@ -855,13 +880,47 @@ $ (sleep 90; echo get_uptime; sleep 3; echo get_clock; sleep 3) | timeout 110 \
 ```
 
 `Timeout on connect` 出現 **2 次**，間隔精準對應 5 秒逾時常數
-（4.93s、5.02s）。第二次逾時後緊接著一個 `serialhdl.py` 既有的
-競態問題（第二次 identify 請求的 response handler 在清理時撞上
-`KeyError: ('identify_response', None)`，導致整個 Python 程序未捕捉
-例外而崩潰，沒能撐到原本 90 秒的總重試預算）——**這是一個附帶發現
-的既有 bug，不在本次任務範圍內**，只如實記錄，不深入除錯。不論有沒有
-這個崩潰，`Timeout on connect` 已經重現兩次，跟 part D/E 觀察到的現象
-一致。
+（4.93s、5.02s）。第二次逾時後緊接著一個未預期的例外：
+
+```
+Traceback (most recent call last):
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 77, in _get_identify_data
+    params = self.send_with_response(msg, 'identify_response')
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 273, in send_with_response
+    return src.get_response([cmd], self.default_cmd_queue)
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 343, in get_response
+    raise error("Unable to obtain '%s' response" % (self.name,))
+serialhdl.error: Unable to obtain 'identify_response' response
+Traceback (most recent call last):
+  File "/home/arduino/klipper/klippy/console.py", line 286, in <module>
+    main()
+  File "/home/arduino/klipper/klippy/console.py", line 281, in main
+    r.run()
+  File "/home/arduino/klipper/klippy/reactor.py", line 329, in run
+    g_next.switch()
+  File "/home/arduino/klipper/klippy/reactor.py", line 374, in _dispatch_loop
+    timeout = self._check_timers(eventtime, busy)
+  File "/home/arduino/klipper/klippy/reactor.py", line 177, in _check_timers
+    t.waketime = waketime = t.callback(eventtime)
+  File "/home/arduino/klipper/klippy/reactor.py", line 52, in invoke
+    res = self.callback(eventtime)
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 77, in _get_identify_data
+    params = self.send_with_response(msg, 'identify_response')
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 273, in send_with_response
+    return src.get_response([cmd], self.default_cmd_queue)
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 339, in get_response
+    self.serial.register_response(None, self.name, self.oid)
+  File "/home/arduino/klipper/klippy/serialhdl.py", line 249, in register_response
+    del self.handlers[name, oid]
+KeyError: ('identify_response', None)
+```
+
+★ **這是在非正常條件（9600 baud + 反覆重連逾時）下觀察到的一次
+現象，本輪沒有在正常鮑率（250000）下重現過，也沒有驗證這是不是
+Klipper upstream 的已知問題**——只附上逐字 traceback，不做「這是
+既有 bug」這種定性判斷，也不猜測觸發機制。`Timeout on connect` 本身
+已經重現兩次，跟 part D/E 觀察到的現象一致，這個例外是額外觀察到的
+副作用，不影響 F5 對逾時本身的驗證結論。
 
 ### F6：還原
 
@@ -912,6 +971,178 @@ klippy 端不需要再重新 identify，只是維持既有連線的 keep-alive/�
 
 ---
 
+## Step 0 總結
+
+| 項目 | 結果 | 出處 |
+|---|---|---|
+| LSE 起振 | 成功，≤0.5 秒（含 SWD 連線開銷）即穩定 `LSERDY=1`，5 個時間點（0.5/1/2/3/5s）全部一致 | 第 3 節 B3 |
+| `RCC_CCIPR3` 實測（開機預設） | `LPUART1SEL=010`（HSI16），不是重置預設的 `000`（PCLK3）——韌體開機時主動設定 | 第 4 節 D0 |
+| LSE/9600 端到端（位元組層級） | **PASS**：TX/RX 在 H（HSI16）跟 L（LSE）兩種時脈下都精確收發、ISR 無錯誤旗標 | 第 5 節 E2-E4（2x2 矩陣） |
+| 9600 baud identify 耗時 | 實測 **7.818 秒**（82 chunks，95.3 ms/chunk），predicted 5.330s（65ms/chunk），差額未拆解成因 | 第 6 節 F4b |
+| `DBGMCU_APB1LFZR` | `0x00001800`：bit12 `DBG_IWDG_STOP=1`、bit11 `DBG_WWDG_STOP=1`——CPU halt（SWD 除錯）期間 IWDG/WWDG 會凍結 | 第 4 節 D0 |
+| `LPUART1_CR1` `FIFOEN`（bit29） | `0`——目前 FIFO 模式**未啟用** | 第 4 節 D0 |
+| `LSESYSEN` 必要性 | 只驗證「設了能動」，**沒有**驗證「不設會失敗」的對照組 | 見上方 D1 段落新增的說明 |
+| identify 5 秒逾時的根因 | 確認是 `serialhdl.py:99` 的硬編碼常數，9600 baud 下傳輸完整字典天生就需要 >5 秒，不是硬體/協定限制 | 第 6 節 Part F |
+
+---
+
+---
+
+## Part C：收尾查證（唯讀，不寫任何暫存器、不改韌體檔）
+
+★ 命名上 Part C 照字母順序應該排在 Part B 之後、Part D 之前，但實際
+執行順序是在 Part D/E/F 之後才補做的（本輪任務），內容也刻意設計成
+只讀不寫，跟 Part D/E/F 的硬體操作獨立、互不依賴。下方內容按 C1-C5
+的順序，不影響本文件其餘章節的既有編號。
+
+### C1：DS13086（STM32U585 datasheet）—— ★ 找不到
+
+```
+$ ls -la ~/klipper/refs/
+rm0456.pdf  rm0456.txt  stm32u585xx.h
+```
+
+PC（`~/klipper/refs/`）跟板子（`~/klipper` 全目錄搜過）都沒有
+DS13086 或任何 datasheet 檔案，只有 RM0456（reference manual）跟
+CMSIS header。**t_WULPUART（或 LPUART wakeup time）、tSU(HSI16)、
+Stop2 exit 到執行第一條指令的 wakeup time，這三個數字本輪都找不到**，
+依指示不推估、不代打去網路抓，誠實記錄成「找不到」。
+
+**A2 的 BaudMax 用實際 t_WU 重算**：因為沒有真實 datasheet 數值，
+這一步做不了，只能沿用 A2 原本引用的 RM0456 範例數字（`tWULPUART=3µs`
+（範例值）、HSI16 inaccuracy 1%（範例值）→ `BaudMax≈88.36 kbaud`）。
+沒有第二組真實數字可以並列比較，這是本輪最大的一塊空白，記在下方
+「我無法判定的事」。
+
+### C2：`LPUART1SEL=LSE` 是否需要 `LSESYSEN=1`
+
+**需要。** RM0456 §11.4.7「LSE clock」小節「LSE when used by
+peripherals other than RTC/TAMP, and RCC functions」（行
+33306-33320）：
+
+> 33308-33309: "By default, when enabled, the LSE is sent only to RTC
+> and TAMP (assuming that RTCSEL = 01)."
+>
+> 33311-33320: "It the LSE is needed for other peripherals (such as
+> peripheral clock or trigger source)... the sequence below must be
+> done: 1. Set LSEON in RCC_BDCR, and wait for LSERDY = 1 in RCC_BDCR.
+> **2. Set LSESYSEN = 1 in RCC_BDCR.** 3. Wait for LSESYSRDY = 1 in
+> RCC_BDCR."
+
+LPUART1 的 kernel clock 屬於「peripheral clock」，不是 RTC/TAMP，
+落在「其他周邊」這個分類，所以按 RM 字面要求，`LSESYSEN=1` 是必要
+步驟（第 2 步），不是可省略的選項。Part D/F 的 D1 已經照這個順序做過
+（`LSEON`→`LSERDY`→`LSESYSEN`→`LSESYSRDY`），但如 C0 已補充的說明，
+本輪沒有做「不設 `LSESYSEN` 會失敗」的對照組實測，只確認了 RM 字面
+要求，沒有實測驗證它是不是真的不可或缺。
+
+### C3：Stop2 + autonomous 模式下 FIFO 是否能持續收資料、哪個事件喚醒核心
+
+RM0456 §67.4.15「LPUART autonomous mode」，「LPUART reception mode」
+小節（行 188006-188017）：
+
+```
+•  If the FIFO mode is enabled, the APB clock is requested when
+   -  The RxFIFO is full (RXFF = 1) and the corresponding interrupt
+      is enabled (RXFFIE = 1)
+   -  The RxFIFO threshold is reached (RXFT = 1) and the corresponding
+      interrupt is enabled (RXFTIE = 1)
+   -  The RxFIFO is not empty (RXFNE = 1) and the corresponding
+      interrupt or DMA is enabled (RXFNEIE = 1)
+•  If the FIFO mode is disabled, the APB clock is requested when the
+   LPUART finishes sampling data and it is ready to be written in the
+   LPUART_RDR.
+```
+
+搭配 A1 已查過的機制（RM0456 行 33746-33749）：「autonomous peripheral
+requests its kernel clock... the internal oscillator (HSI16 or MSI) is
+woken up if it was off, and the kernel clock is propagated only to the
+peripheral requesting it」——**kernel clock 的喚醒（讓 LPUART 矽片本身
+運作、把位元組移進 RDR/FIFO）跟 APB clock 的喚醒（讓 CPU/匯流排醒來、
+CPU 才看得到中斷）是兩件事**。RM 的字面意思是：**FIFO 可以在 CPU
+仍處於 Stop2（只有 kernel clock 短暫醒來處理每個位元組）的狀態下持續
+累積資料，直到 `RXFF`/`RXFT`/`RXFNE` 三個條件之一（依對應的
+`RXFFIE`/`RXFTIE`/`RXFNEIE` 是否致能）觸發 APB clock request，這時候
+才會真的喚醒 CPU（如果對應中斷有致能的話）**。也就是說，喚醒核心的
+事件**不是單一固定的旗標**，而是這三個 FIFO 相關中斷致能位元裡
+「已致能」的那一個先達成條件。
+
+**`WUS[1:0]`、`WUFIE` 這兩個欄位名稱——★ 在 RM0456 Rev 7 全文找不到**
+（`grep` 全文零命中，`LPUART_CR3`/`LPUART_CR3 [alternate]` 兩個版本都
+沒有這兩個欄位，`USART_CR3` 也沒有）。這可能是沿用了其他 STM32 系列
+（例如 F0/L0/G0，那些系列的 USART_CR3 確實有 `WUS[1:0]`/`WUFIE` 這組
+「Stop 模式喚醒方式選擇」欄位）的假設，但**這顆 STM32U585 的
+USART/LPUART 外設沒有這組欄位**，喚醒方式是靠上面 `RXFFIE`/
+`RXFTIE`/`RXFNEIE` 這組既有的 FIFO 中斷致能位元決定，不需要（也沒有）
+額外的 WUS 選擇器。這點跟任務原本的假設不符，如實回報，不硬套。
+
+`RXFTCFG[2:0]`（LPUART_CR3 bits 27:25，行 188781，§67.7.4）：
+「Receive FIFO threshold configuration」，設定 RXFIFO 到達幾分之幾
+深度時觸發 `RXFT`，`000`=1/8 depth ... `101`=FIFO 滿。這個欄位只能在
+`UE=0` 時寫入。
+
+### C4：`stm32u5_sysclk_restore()` 耗時 + LPUART ISR 現況
+
+**`stm32u5_sysclk_restore()`（現名 `stm32u5_sysclk_bringup()`）的耗時
+——查遍 `docs/stop2_2a_*.md`，★ 未量測。** 既有文件只有質化描述（它是
+「每輪固定開銷」的一部分，見 [[stop2_2a_final_measurements]] 第 2.3
+節）跟一個布林旗標 `restore_timeout`（[[stop2_2a_review]]：「非0=還原
+過程中至少一段忙等逾時」），沒有任何一份文件量過它實際花幾毫秒/微秒。
+
+**LPUART ISR 現況**（`src/stm32/stm32f0_serial.c:147-161`）：
+
+```c
+void
+USARTx_IRQHandler(void)
+{
+    uint32_t sr = USARTx->ISR;
+    if (sr & USART_ISR_RXNE)
+        serial_rx_byte(USARTx->RDR);
+    if (sr & USART_ISR_TXE && USARTx->CR1 & USART_CR1_TXEIE) {
+        uint8_t data;
+        int ret = serial_get_tx_byte(&data);
+        if (ret)
+            USARTx->CR1 = CR1_FLAGS;
+        else
+            USARTx->TDR = data;
+    }
+}
+```
+
+**目前每次中斷只讀 1 個 byte**：`if (sr & USART_ISR_RXNE)` 是單次
+`if`，不是迴圈，讀一次 `RDR` 就結束。這跟 D0 量到的
+`FIFOEN=0`（第 4 節）一致——`FIFOEN=0` 時 `RDR` 本來就只能存一個
+byte，`RXNE` 語意是「這一個 byte 到了」，單次 `if` 沒有問題。
+
+**若開 FIFO（`FIFOEN=1`）需要改成 `while(RXFNE)` 迴圈排空**：
+`FIFOEN=1` 時同一個位元位置改叫 `RXFNE`（RX FIFO Not Empty），語意
+變成「FIFO 裡還有沒讀完的資料」，只要 FIFO 非空這個 flag 就會持續
+成立。現在這個單次 `if` 的寫法在 FIFO 模式下**每次中斷只會排空一個
+byte**，如果中斷是邊緣觸發，多出來的 byte 會留在 FIFO 裡等下一次
+其他事件才被讀走（可能造成延遲或需要額外機制才能觸發下一次中斷）；
+如果是電位觸發，NVIC 會因為 `RXFNE` 仍為 1 而立刻重新進入 ISR，效果上
+還是一次一個 byte，但這樣就沒有真正利用到 FIFO 批次處理、減少中斷
+次數的優勢，等於白開 FIFO。要真正拿到 FIFO 的好處，ISR 需要改成
+`while (sr & USART_ISR_RXNE) { serial_rx_byte(USARTx->RDR); sr =
+USARTx->ISR; }` 這種形式，把 FIFO 一次排空。★ 這是**還沒做**的程式
+改動，本輪只讀不改，如實記錄現況與需要的修改方向。
+
+### C5：(b) vs (c) 判準（暫不下結論）
+
+| 項目 | 方案 (b)：LSE + 9600 動態切換 | 方案 (c)：HSI16 按需喚醒維持 250000 |
+|---|---|---|
+| **需要改動的範圍** | `RCC_CCIPR3`/`RCC_BDCR` 動態切換邏輯（含 D2 驗證過的 RMW 序列）、鮑率切換時機判斷（何時從 250000 切到 9600、何時切回）、host 端（printer.cfg／moonraker）需要能接受 MCU 端鮑率變化、或維持雙鮑率並行的機制 | LPUART1 autonomous mode 相關暫存器（`RCC_APB3SMENR.LPUART1SMEN`、`RCC_SRDAMR.LPUART1AMEN`、`UESM`），可能需要開 FIFO（`FIFOEN=1`）並把 ISR 改成 `while(RXFNE)` 排空迴圈（C4），不需要動態切換鮑率/時脈源 |
+| **Race 風險** | 鮑率切換的那個瞬間，host 端跟 MCU 端對「現在該用哪個鮑率」的認知如果不同步，會直接斷線（跟本輪 part D/E/F 測試 9600 冷開機時看到的連線失敗屬於不同性質，但機制上都跟「雙方鮑率認知是否一致」有關）；LSE 起振（part B 量到 <0.5s，但只測過一顆板子一種 `LSEDRV`）如果在某些板卡/溫度下變慢，切換時機的假設可能不成立 | HSI16 喚醒延遲（`tWULPUART`）與 250000 baud 的 bit period（4µs）競爭，C1 沒有真實 datasheet 數字可以確認裕度；FIFO 累積多個 byte 後才觸發中斷，若 ISR 沒有先改成 `while` 排空（C4），有資料在 FIFO 裡但沒被讀走、被下一批資料覆蓋（overrun）的風險 |
+| **(c) 的判準** | 不適用 | `wake_latency < 8 × 40µs = 320µs`（暫定判準，本輪沒有時間去驗證這個數字怎麼來的、是否合理，只是任務給定的門檻，並列在這裡） |
+
+★ **暫不下結論**。C1（datasheet 找不到）讓 (c) 的核心風險（喚醒延遲
+是否真的小於判準）沒辦法用真實數字驗證；(b) 的鮑率切換 race 風險
+也還沒有實測數據。兩個方案各自的風險本質不同（(b) 是「切換時機」的
+race，(c) 是「單次喚醒延遲」的競爭），不是同一個維度可以直接比大小，
+留給下一輪決定要往哪個方向繼續深入。
+
+---
+
 ## 7. 我無法判定的事
 
 1. **A1 的 HSIKERON 疑問**：`LPUART1SEL` 的 RM 註解沒有像 `LPTIM1SEL`/
@@ -953,12 +1184,34 @@ klippy 端不需要再重新 identify，只是維持既有連線的 keep-alive/�
    出現 0 次；用原版（5 秒逾時）重跑則重現 `Timeout on connect` 2 次。
    詳見 part F。part E 提到的（a）（b）（c）三個延伸診斷方向因為根因
    已經確認，不再需要繼續追。
-8. ★ **F5 意外發現的 `serialhdl.py` 既有 bug**：第二次 identify 逾時後，
+8. ★ **F5 觀察到的 `KeyError` 例外，性質未定**：第二次 identify 逾時後，
    `register_response` 清理 handler 時觸發
    `KeyError: ('identify_response', None)`，整個 Python 程序未捕捉例外
-   崩潰，沒能撐滿原本 90 秒的重試預算。這看起來是連續兩次快速逾時之間
-   的一個競態（第一次逾時的清理跟第二次請求的註冊時序重疊），但本輪
-   只在 F5 這一次觀察到，沒有嘗試重現或深入追查，不確定是否每次「連續
-   兩次 5 秒內逾時」都會觸發，還是這次剛好撞上的特例；也不確定這個 bug
-   是否只在 9600 這種逾時密集重試的場景才會暴露，正常 250000 baud
-   下幾乎不會連續逾時兩次，可能是這個 bug 至今沒被注意到的原因。
+   崩潰，沒能撐滿原本 90 秒的重試預算。這是在**非正常條件**（9600 baud
+   + 反覆重連逾時）下觀察到的**一次**現象，本輪只在 F5 這次看到，沒有
+   嘗試重現、沒有在正常鮑率（250000）下測過會不會發生、也沒有去查
+   Klipper upstream 是否已知這個問題——不確定是連續兩次快速逾時之間的
+   競態、還是這次剛好撞上的特例，誠實標註為未驗證，不下定性判斷。
+9. ★★ **C1：`t_WULPUART`/`tSU(HSI16)`/Stop2 exit wakeup time 這三個
+   datasheet 數字完全找不到**——DS13086 這份文件在 PC 跟板子上都不存在，
+   `refs/` 目錄只有 RM0456 跟 CMSIS header。這直接導致 A2「250000 baud
+   下 Stop2 喚醒是否安全」這個問題**沒辦法用真實數字驗證**，只能沿用
+   RM0456 自己的範例數字（`tWULPUART=3µs`、HSI16 inaccuracy 1%，RM
+   明文註明「僅供範例參考」）。這是目前整個 2B step 0 系列裡最大的
+   一塊空白：C5 的方案 (c) 判準（`wake_latency < 320µs`）沒有真實
+   `wake_latency` 數字可以拿來對照，這個判準目前完全是空的，沒有辦法
+   判斷 (c) 到底過不過。
+10. **C3：`RXFF`/`RXFT`/`RXFNE` 三種 FIFO 喚醒事件，本輪只查了 RM
+    文字，沒有實測驗證哪一種實際用起來最適合 Stop2 場景**（例如
+    `RXFT` 搭配適當的 `RXFTCFG` 閾值，理論上應該最能平衡「累積幾個
+    byte 才喚醒」跟「喚醒夠即時」，但這只是從 RM 文字描述的合理推論，
+    沒有實測數據支持哪個閾值實際效果最好）。
+11. **C4：`stm32u5_sysclk_restore()` 的實際耗時、ISR 改成 `while` 迴圈
+    後的實測效果，都還沒有量測或實作**——C4 只確認了「現在的 ISR 一次
+    只讀一個 byte」「若開 FIFO 需要改」這兩件事，改完之後實際的中斷
+    負載/延遲有沒有改善，本輪完全沒有數據，需要留到真的動手實作
+    FIFO+`while` 排空之後才能量。
+12. **C5 的 `wake_latency < 8×40µs=320µs` 這個判準本身的由來未查**：
+    任務給定這個數字，本輪沒有去推導或驗證這個門檻是怎麼算出來的
+    （例如是不是跟某個 byte 數/位元時間的假設有關），只是把它並列在
+    C5 表格裡，不代表本輪驗證過這個數字合理。

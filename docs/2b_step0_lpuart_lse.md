@@ -1014,6 +1014,11 @@ Stop2 exit 到執行第一條指令的 wakeup time，這三個數字本輪都找
 沒有第二組真實數字可以並列比較，這是本輪最大的一塊空白，記在下方
 「我無法判定的事」。
 
+★ 後續嘗試自動下載 DS13086 PDF 也失敗（4 種 curl 方式皆逾時/被擋），
+完整的缺口清單（含 `tWUSTOP2`/`tWULPUART`/`tSU(HSI16)`/`tSU(LSE)`
+四個參數各自對應的表號、影響的結論、補齊方式）見
+[[2b_g_wake_latency]] 的「外部規格缺口（DS13086）」一節，不在此重複。
+
 ### C2：`LPUART1SEL=LSE` 是否需要 `LSESYSEN=1`
 
 **需要。** RM0456 §11.4.7「LSE clock」小節「LSE when used by

@@ -555,3 +555,77 @@ MCU 的 `clock`／`CYCCNT` 換算回真實時間的機制），而 Stop2 睡眠�
 範圍內**。Step 2 只驗證「LPUART1 這一層的收發正確性」，不驗證
 「長時間掛著 klippy daemon、Stop2 睡眠會不會把 clocksync 搞壞」——
 兩件事分開驗證，避免 step 2 的結論被 step 3 才要解決的問題污染。
+
+---
+
+## 7. 實作階段發現（規格文件未涵蓋）
+
+### `CR1_FLAGS` 覆寫問題
+
+**本規格原本第 2 節給的 `serial_init()` 程式碼片段有一個沒發現的
+bug**，是在真正動手改程式碼、逐行確認每個 `CR1` 寫入點時才發現的：
+
+`USARTx_IRQHandler()` 裡「TX 沒有下一筆資料時關掉 `TXEIE`」那一行
+（`stm32f0_serial.c` 原本第 157 行）：
+
+```c
+if (ret)
+    USARTx->CR1 = CR1_FLAGS;
+```
+
+如果 `CR1_FLAGS` 還是規格文件原本沿用的舊定義（`UE|RE|TE|RXNEIE`，
+不含 `UESM`/`FIFOEN`），**每次一輪 TX 送完、`serial_get_tx_byte()`
+回報沒有更多資料要送，這行就會把 `serial_init()` 好不容易設起來的
+`UESM`（bit1）跟 `FIFOEN`（bit29）整顆蓋掉清成 0**——c1 的
+autonomous 收資料機制會在**第一次送出任何回應之後**失效，而且是
+**靜默失效**（不會有任何錯誤訊息，FIFO 收資料這件事本身在
+`FIFOEN=0` 下退化回單筆 `RXNE` 語意，短時間內未必會被察覺，直到
+Stop2 期間真的漏資料才會顯現）。這個 bug **不是規格文件的邏輯錯
+（規格的暫存器清單、位元、行號都對），是把規格的暫存器清單套進
+既有程式碼時，沒有意識到 `CR1_FLAGS` 這個既有巨集被四個不同地方
+共用，其中一個是規格文件完全沒提到的 ISR 內部寫回**。
+
+**修法**（已實作，見 `src/stm32/stm32f0_serial.c` 這次的 diff）：
+把 `CR1_FLAGS` 本身依 target 條件式定義——`LPUART_BRR` 且
+`CONFIG_MACH_STM32U585` 時，`CR1_FLAGS` 直接包含 `UESM|FIFOEN`，
+讓所有寫回 `CR1` 的地方（不管是不是為了處理 `UESM`/`FIFOEN`
+本身）都自動保留這兩個位元，不用逐一稽核每個寫入點：
+
+```c
+#if defined(LPUART_BRR) && CONFIG_MACH_STM32U585
+  #define CR1_FLAGS (USART_CR1_UE | USART_CR1_RE | USART_CR1_TE     \
+                     | USART_CR1_RXNEIE | USART_CR1_UESM            \
+                     | USART_CR1_FIFOEN)
+#else
+  #define CR1_FLAGS (USART_CR1_UE | USART_CR1_RE | USART_CR1_TE   \
+                     | USART_CR1_RXNEIE)
+#endif
+```
+
+### 稽核：還有沒有其他地方直接寫 `CR1`
+
+```
+$ grep -n "\.CR1\s*=\|->CR1\s*=" src/stm32/stm32f0_serial.c
+171:            USARTx->CR1 = CR1_FLAGS;                    // ISR 內，關 TXEIE
+180:    USARTx->CR1 = CR1_FLAGS | USART_CR1_TXEIE;           // serial_enable_tx_irq()
+209:    USARTx->CR1 = USART_CR1_FIFOEN;                      // serial_init()，UE=0 階段，刻意的兩段式寫入
+210:    USARTx->CR1 = CR1_FLAGS;                              // serial_init()，最終完整寫入
+213:    USARTx->CR1 = CR1_FLAGS;                              // 非 U5/LPUART_BRR 分支
+```
+
+五個寫入點，全部在 `stm32f0_serial.c` 這一個檔案裡：171/180/213 都
+透過修正後的 `CR1_FLAGS`（自動含 `UESM|FIFOEN`）；209 是刻意的
+「先只開 `FIFOEN`、`UE` 還是 0」兩段式初始化第一步，不是漏洞。
+另外搜尋全專案有沒有其他地方繞過這個驅動、直接寫 `LPUART1->CR1`
+或位址 `0x46002400`：
+
+```
+$ grep -rn "LPUART1->CR1\|0x46002400" src/stm32/*.c src/generic/*.c
+u5_main.c:25:    if (periph_base == 0x46002400UL) /* LPUART1 */
+u5_main.c:34:    if (periph_base == 0x46002400UL) /* LPUART1: HSI16 */
+```
+
+這兩處只是 `periph_base` 的比對（`lookup_clock_line()`/
+`get_pclock_frequency()` 拿來辨識是不是 LPUART1），不是暫存器寫入。
+**確認全專案只有這五個 `CR1` 寫入點，全部已經透過修正後的
+`CR1_FLAGS` 正確保留 `UESM`/`FIFOEN`，沒有其他遺漏的覆寫路徑。**

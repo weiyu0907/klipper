@@ -141,15 +141,29 @@
   #define USART_ISR_TXE USART_ISR_TXE_TXFNF
 #endif
 
-#define CR1_FLAGS (USART_CR1_UE | USART_CR1_RE | USART_CR1_TE   \
-                   | USART_CR1_RXNEIE)
+#if defined(LPUART_BRR) && CONFIG_MACH_STM32U585
+  // 2B c1: Stop2 autonomous RX wake -- UESM/FIFOEN must stay set on
+  // every CR1 write (including the ISR's "turn off TXEIE" write-back),
+  // or a TX-complete interrupt would silently clear them.
+  #define CR1_FLAGS (USART_CR1_UE | USART_CR1_RE | USART_CR1_TE     \
+                     | USART_CR1_RXNEIE | USART_CR1_UESM            \
+                     | USART_CR1_FIFOEN)
+#else
+  #define CR1_FLAGS (USART_CR1_UE | USART_CR1_RE | USART_CR1_TE   \
+                     | USART_CR1_RXNEIE)
+#endif
 
 void
 USARTx_IRQHandler(void)
 {
     uint32_t sr = USARTx->ISR;
-    if (sr & USART_ISR_RXNE)
+    // 2B c1: FIFOEN=1 時這個 bit 是 RXFNE（FIFO 非空），一次中斷可能
+    // 已經累積多筆（RXFT 門檻式喚醒），必須排空到 FIFO 真的空了為止
+    // ——非 FIFO 模式下這個迴圈頂多跑一次，行為不變。
+    while (sr & USART_ISR_RXNE) {
         serial_rx_byte(USARTx->RDR);
+        sr = USARTx->ISR;
+    }
     if (sr & USART_ISR_TXE && USARTx->CR1 & USART_CR1_TXEIE) {
         uint8_t data;
         int ret = serial_get_tx_byte(&data);
@@ -170,6 +184,12 @@ void
 serial_init(void)
 {
     enable_pclock((uint32_t)USARTx);
+#if defined(LPUART_BRR) && CONFIG_MACH_STM32U585
+    // 2B c1: APB3SMENR/SRDAMR LPUART1SMEN/AMEN -- required for LPUART1
+    // to wake the MCU from Stop modes (RM0456 lines 39384-39389 /
+    // 39541-39546). See docs/2b_step2_impl_spec.md section 2.
+    lpuart1_enable_stop_wake();
+#endif
 
     uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
 #if defined(LPUART_BRR)
@@ -179,8 +199,19 @@ serial_init(void)
     USARTx->BRR = (((div / 16) << USART_BRR_DIV_MANTISSA_Pos)
                    | ((div % 16) << USART_BRR_DIV_FRACTION_Pos));
 #endif
+#if defined(LPUART_BRR) && CONFIG_MACH_STM32U585
+    // 2B c1: FIFO + RXFT 門檻式喚醒（RXFTCFG=000=1/8 深度=1 byte，
+    // 理由見 docs/2b_step2_impl_spec.md 設計決策 2）。RXFTCFG/FIFOEN
+    // 只能在 UE=0 時寫（此時 CR1 UE 還是 reset 值 0），OVRDIS 維持 1
+    // 不變（設計決策 1）。
+    USARTx->CR3 = USART_CR3_OVRDIS | USART_CR3_RXFTCFG_000
+                  | USART_CR3_RXFTIE;
+    USARTx->CR1 = USART_CR1_FIFOEN;   // UE 還是 0，先單獨開 FIFO
+    USARTx->CR1 = CR1_FLAGS;          // 這裡已經含 UESM|FIFOEN
+#else
     USARTx->CR3 = USART_CR3_OVRDIS; // disable the ORE ISR
     USARTx->CR1 = CR1_FLAGS;
+#endif
     armcm_enable_irq(USARTx_IRQHandler, USARTx_IRQn, 0);
 
     gpio_peripheral(GPIO_Rx, USARTx_FUNCTION, 1);

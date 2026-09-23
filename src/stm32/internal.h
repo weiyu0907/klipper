@@ -86,17 +86,28 @@ typedef struct {
 void lpuart1_handler(void);
 #define LPUART1_IRQHandler lpuart1_handler
 
-#define USART_ISR_RXNE   0x0020U
+#define USART_ISR_RXNE   0x0020U   // FIFOEN=1 時同一個 bit 代表 RXFNE
 #define USART_ISR_TXE    0x0080U
 #define USART_ISR_ORE    0x0008U
+#define USART_ISR_TC     0x0040U   // ISR bit6，RM0456 行 189273
 #define USART_CR1_UE     0x0001U
+#define USART_CR1_UESM   0x0002U   // CR1 bit1，RM0456 行 188386
 #define USART_CR1_RE     0x0004U
 #define USART_CR1_TE     0x0008U
 #define USART_CR1_RXNEIE 0x0020U
 #define USART_CR1_TXEIE  0x0080U
+#define USART_CR1_FIFOEN 0x20000000U // CR1 bit29，RM0456 行 188234
 #define USART_CR3_OVRDIS 0x1000U
+#define USART_CR3_RXFTIE 0x10000000U // CR3 bit28，RM0456 行 188763
+#define USART_CR3_RXFTCFG_000 0x00000000U // CR3 bits27:25=000（1/8深度），行 188781-188782
 #define USART_BRR_DIV_MANTISSA_Pos 4
 #define USART_BRR_DIV_FRACTION_Pos 0
+
+// 2B c1：LPUART1 的 APB3SMENR/SRDAMR 位元致能（實作於 u5_main.c，
+// 跟 LPTIM1 在 stm32u5_lowpower.c 的直寫模式一致，見
+// docs/2b_step2_impl_spec.md 第 2 節）——已經在
+// #if defined(CONFIG_MACH_STM32U585) 區塊內，不需要再包一層
+void lpuart1_enable_stop_wake(void);
 
 // 6. GPIO & Watchdog
 typedef struct { volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR, BSRR, LCKR, AFR[2], BRR; } GPIO_TypeDef;

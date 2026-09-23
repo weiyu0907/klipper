@@ -1,10 +1,31 @@
-# Milestone 2B step 2 — c1 實作規格（先出規格，不改程式碼）
+# Milestone 2B step 2 — c1 實作規格
 
 延續 [[2b_step1_design]]。本輪把 step 1 列出的開放問題（EXTI 需不需要、
 UESM 跟 SMEN/AMEN 的分工、FIFO 排空要看哪個旗標、TX 完成怎麼確認）
 查證清楚，並把 step 1 沒下的三個設計決策定案（見下），產出可以直接
-照著改的規格。**本輪仍然唯讀，沒有改韌體、沒有碰暫存器**，規格文件
-先給使用者過目，核准後才進入實作。
+照著改的規格。規格已經過使用者核准，**進入實作，但分兩階段燒錄**
+（見第 0 節），每階段各自 `make` 後停下等待燒錄批准，不會一次改完
+兩階段再一起燒。
+
+## 0. 實作分階段（使用者核准的計畫）
+
+**階段 1**（本輪先做）：`internal.h` 補位元巨集、`serial_init()`
+（`UESM`/`FIFOEN`/`RXFTCFG=000`/`RXFTIE`）、ISR 改
+`while (RXFNE)` 排空迴圈、`u5_main.c` 加 `APB3SMENR`＋`SRDAMR` 的
+`LPUART1` 位元。**不動 `stop2_once()`**——這一階段結束時，LPUART1
+的 autonomous/FIFO 設定全部到位，但 Stop2 進入序列本身還是舊版，
+目的是**先確認 FIFO/UESM 這些改動不會破壞現有的 250000 baud 正常
+通訊**，跟 Stop2 喚醒行為本身分開驗證，出問題時範圍容易鎖定。
+
+階段 1 驗證：燒錄後 `state=ready`、`bytes_retransmit=0`、
+`bytes_invalid=0`，**持續觀察至少 10 分鐘**，確認 FIFO 改動沒有
+破壞正常通訊。**這一階段通過才做階段 2**。
+
+**階段 2**（階段 1 通過後）：`stop2_once()` 加 `wfi` 前等待
+`TC=1`（含逾時，逾時要計數並透過 `test_stop2` 回報，見第 3 節的
+`tc_timeout=%u`），並加 Stop2 期間收資料的測試。
+
+每一階段都是 `make` 後停下等待燒錄批准，不逾越。
 
 ## 設計決策（已定）
 
@@ -268,34 +289,74 @@ reset」，`enable_pclock()`（`clockline.c:12-24`）呼叫模式是「查一次
 巨集搬到 `internal.h` 給兩個檔案共用——**這是一個小的架構選擇，本輪
 先列出來，留到實作階段再定**。
 
-### `src/stm32/stm32u5_lowpower.c`：`stop2_once()` 加 TC 等待
+### `src/stm32/stm32u5_lowpower.c`：`stop2_once()` 加 TC 等待（**階段 2**）
 
 查證 D 的結論：進 `wfi` 前要確認 `TC=1`，含逾時保護。插入位置：現有
 `irq_disable()` 之後、`dsb`/`wfi` 之前（跟 `IWDG->KR = 0xAAAA;` 睡前
 餵狗同一段，順序上建議放在餵狗之前，避免逾時等待吃掉太多 IWDG
-預算）：
+預算）。
+
+★ 逾時不是無害動作，要能看到發生頻率，比照 `restore_timeout`/
+`lptim_timeout` 既有的「per-round 記一個 flag + 跑完整組
+`cycles` 後總計」兩層模式，新增 `struct stop2_status.tc_timeout`
+（0/1，per round）跟 `command_test_stop2()` 裡的累加計數
+`tc_timeout_n`，最終送一則獨立的 `sendf`：
+
+```c
+/* struct stop2_status 新增一個欄位，跟 entry_fail/restore_timeout/
+ * lptim_timeout 同一組「per-round 診斷旗標」 */
+uint32_t tc_timeout;
+```
 
 ```c
 {
     /* 2B c1：進 Stop2 前確認 TX 已送完（TC=1），避免 Stop2 期間
      * peripheral clock 被切斷、最後一筆傳輸被截斷（RM0456 行
      * 183305-183310）。含逾時保護，沿用檔案既有的 U5_WAIT_LOOPS
-     * 上限慣例（見 (e) 條款），逾時不是致命錯誤，只是不保證這一輪
-     * 最後一個 TX byte 有沒有送完整，用既有的 restore_timeout 類似
-     * 欄位回報，不中止 Stop2 流程本身。 */
+     * 上限慣例（見 (e) 條款），逾時不是致命錯誤（不阻擋、不中止
+     * Stop2 流程），但必須算進 tc_timeout 讓 host 端看得到頻率。 */
     volatile uint32_t j;
+    uint32_t tc_to = 0;
     for (j = 0; j < U5_WAIT_LOOPS; j++) {
         if (LPUART1->ISR & USART_ISR_TC)
             break;
     }
-    /* j >= U5_WAIT_LOOPS 代表逾時，是否要記錄到 stop2_status
-       留給實作階段決定欄位設計，本輪只定義行為：逾時不阻擋、
-       不無限等待，繼續往下進 Stop2。 */
+    if (j >= U5_WAIT_LOOPS)
+        tc_to = 1;
+    s_status.tc_timeout = tc_to;   /* stop2_capture_status() 呼叫前先存，
+                                     * 或把 tc_to 當參數傳進
+                                     * stop2_capture_status()，比照
+                                     * restore_timeout/lptim_timeout
+                                     * 既有的傳參模式，實作時擇一 */
 }
 IWDG->KR = 0xAAAA;
 __asm volatile ("dsb" ::: "memory");
 __asm volatile ("wfi");
 ```
+
+`command_test_stop2()` 端：比照既有 `seg_max`/`seg_sum`/
+`cr_first`/`cr_last` 的累加模式，新增 `tc_timeout_n`，每輪累加
+`s_status.tc_timeout`，跑完整組 `cycles` 後送一則獨立 `sendf`：
+
+```c
+uint32_t tc_timeout_n = 0;
+...
+for (n = 1; n <= cycles; n++) {
+    stop2_once();
+    ...
+    tc_timeout_n += s_status.tc_timeout;
+    ...
+}
+...
+sendf("stop2_tc_timeout n=%u tc_timeout=%u", agg_n, tc_timeout_n);
+```
+
+`n=%u` 用既有的 `agg_n`（跑完整組、`!entry_fail` 的輪數，跟
+`stop2_lat_max`/`stop2_lat_sum` 的 `n` 同一個基準），`tc_timeout=%u`
+是這組測試裡逾時發生的次數——0 代表這組測試完全沒逾時，非 0 就是
+第 6 節「若核心不醒」SOP 之外、另一個需要正視的訊號：TC 逾時代表
+TX 沒有在合理時間內送完，即使本規格選擇「逾時不阻擋」，頻繁發生
+就代表 3.1 節的 TX race 風險不是理論案例，需要回頭檢視。
 
 ---
 
@@ -418,3 +479,79 @@ TX race（3.1）目前沒有專門的自動化驗證手法，暫時只能靠 4.1
 測試期間如果剛好命中「Stop2 進入時 TX 未完成」這個時間點、
 觀察是否出現對應的資料錯誤來間接佐證，**沒有專門針對 3.1 設計的
 定向測試，列為本規格的已知覆蓋缺口**。
+
+---
+
+## 5. 若核心不醒：分辨 SOP
+
+如果實作後量測發現 MCU 在 Stop2 期間對 host 送來的資料完全沒反應
+（比 3.3 節「FIFO 排空/門檻設定錯誤」的陣發性症狀更極端——完全
+沒醒過），**先分辨是「有收到但喚醒路徑不通」還是「連收都沒收到」，
+這兩條路要查的東西完全不同，事先寫好避免亂試**：
+
+```
+$ sudo systemctl stop klipper
+$ sudo openocd -f /home/arduino/uno_q.cfg -c "halt" \
+    -c "mdw 0x4600241C" -c "resume" -c "shutdown"
+```
+
+`0x4600241C` = `LPUART1_ISR`（`LPUART1` base `0x46002400` + offset
+`0x1C`，RM0456 行 189098）。讀回值逐位元判讀（`FIFOEN=1` 時的
+layout，RM0456 行 189108）：
+
+- **`RXFT`（bit 26，`0x04000000`）或 `RXFNE`（bit 5，`0x00000020`）
+  已經置位** → **資料有收到，FIFO 裡躺著東西，但喚醒路徑不通**。
+  這代表 LPUART1 本身正常運作（`UESM`/`RCC` 三個致能位元、`FIFOEN`/
+  `RXFTCFG` 都生效），問題出在「FIFO 有東西之後，為什麼沒有把 CPU
+  從 `wfi` 叫醒」。**查證 A（不需要 EXTI）在這個情境下算是被
+  推翻的負面證據——回頭檢查**：
+  1. `NVIC_ISER2` 裡 `LPUART1_IRQn`(66) 對應的 bit（`66-64=2`）是否
+     真的是 1（`mdw` 讀 NVIC ISER2，位址視 CMSIS 定義，比照
+     `stop2_once()` 裡 `NVIC_ICPR2`/`NVIC_ISER2` 既有用法）；
+  2. 重新檢視查證 A 的結論是否真的適用這顆矽片/這個 revision（本輪
+     查證只查了 RM0456 文字，沒有拿示波器/邏輯分析儀實測過「RXFT
+     觸發瞬間到 NVIC pending 之間」有沒有中間步驟被遺漏）；
+  3. `RXFTIE`（`CR3` bit28）是不是真的寫進去了、有沒有被後續某次
+     `CR3` 整顆覆寫蓋掉（本規格的改法是 `CR3 = OVRDIS | RXFTCFG_000
+     | RXFTIE` 一次寫齊，理論上不會，但要確認沒有其他程式碼路徑
+     後來又寫了一次 `CR3`）。
+- **旗標全空**（`RXFT`/`RXFNE`/`RXFF` 都是 0） → **連收都沒收到**，
+  問題出在資料根本沒進到 LPUART1，或 LPUART1 根本沒在低功耗模式下
+  運作。查：
+  1. `SMEN`/`AMEN`（`RCC_APB3SMENR`/`RCC_SRDAMR` bit6）是否真的被
+     設起來（`mdw 0x46020CD0`/`mdw 0x46020CD8`，核對 bit6）；
+  2. `UESM`（`LPUART1_CR1` bit1，`mdw 0x46002400`）是否真的被設起來
+     （檢查有沒有被 `serial_init()` 之後的某次 `CR1` 寫入覆蓋掉——
+     跟 `TE`/`RE` 一樣容易在整顆覆寫時漏掉）；
+  3. 供電/GPIO 層級：`PG7`/`PG8`（`RESERVE_PINS_serial`）腳位功能
+     是否還是 LPUART1（`gpio_peripheral()` 呼叫有沒有被某處改動）；
+  4. 用示波器/邏輯分析儀直接量 `PG8`（RX 腳）在 host 送資料時有沒有
+     真的出現訊號——排除「host 端根本沒送到板子」這種更底層的
+     可能性。
+
+這兩條路徑查的暫存器完全不重疊（第一條查 NVIC/中斷路徑，第二條查
+RCC 致能鏈跟腳位），**先用 `mdw 0x4600241C` 分岔，再決定往哪條路
+查，不要兩條同時亂試**。
+
+---
+
+## 6. Step 2 通過標準
+
+**Step 2 的通過標準是「Stop2 期間不掉 byte」**——即第 4 節 4.1/4.2
+兩組測試（穩態流量 + 連續多封包壓力測試）都乾淨通過
+（`bytes_invalid=0`、`bytes_retransmit=0`），加上階段 2 的
+`tc_timeout` 計數為 0 或落在可接受範圍（本規格沒有明訂「可接受的
+非零次數」，若出現非零，回到第 3.1 節、視發生頻率決定是否要繼續
+往下、還是先解決 TX race 再繼續）。
+
+★ **明確不包含「klippy 長期連線」這個判準**：`console.py`（第 4 節
+用來驅動測試的工具）**不會跑 clocksync**（Klipper host 端用來把
+MCU 的 `clock`／`CYCCNT` 換算回真實時間的機制），而 Stop2 睡眠期間
+`DWT->CYCCNT` 是停的（[[2b_g_wake_latency]] 開頭就講過
+「Stop2 期間核心時脈停止，`DWT->CYCCNT` 與所有以它為底的計時全部
+凍結」）——`CYCCNT` 一停，`clocksync` 拿掉的時間基準就會失準，這個
+失準怎麼補償（讓真正的 `klippy`／Moonraker 長時間連線在 Stop2 睡眠
+下依然能正確換算時間戳），**是 step 3 的主體工作，不在 step 2
+範圍內**。Step 2 只驗證「LPUART1 這一層的收發正確性」，不驗證
+「長時間掛著 klippy daemon、Stop2 睡眠會不會把 clocksync 搞壞」——
+兩件事分開驗證，避免 step 2 的結論被 step 3 才要解決的問題污染。

@@ -186,34 +186,49 @@ PLL 鎖定，跟睡眠時長無關，只跟「醒來那一刻開始，要重建 
 
 ## 5. `total_latency` 與判讀
 
-```
-total_latency = tWUSTOP2（未量，DS13086 未取得，見 [[2b_step0_lpuart_lse]] C1）
-              + restore_us（實測，本輪）
-```
-
-`tWUSTOP2` 這一段（Stop2 exit 到執行第一條指令的硬體喚醒延遲）
-**沒有真實數字**——[[2b_step0_lpuart_lse]] 的 C1 已經確認 DS13086
-在這個環境裡完全找不到，`restore_us` 是唯一有真實量測值的那一段。
-`total_latency` 因此**無法算出完整數字**，只能報告已知的那一部分：
+★ **DS13086 Rev 10（July 2024）已取得**，`tWUSTOP2` 不再是空白，見
+第 7 節完整查表記錄。本節用查到的數字重算。
 
 ```
-restore_us ≈ 118-121 µs（兩組一致，max 上界 120.938 / 119.875 µs）
+total_latency = tWUSTOP2（DS13086 Table 74，LDO，該列 Max）
+              + restore_us（實測，本輪 max）
 ```
 
-### 三檔判讀（`restore_max`）
+適用列（Table 74，p.210-211）：`twu(Stop 2)` / `All SRAMs retained` /
+`Wake-up in FLASH, SRAM4FWU=0 in PWR_CR2, ICACHE OFF`——選這一列的理由：
+韌體（`stm32u5.c`/`stm32u5_lowpower.c`）沒有任何地方寫 `PWR_CR2` 的
+`SRAM4FWU`/`FLASHFWU`、也沒有動 `ICACHE_CR`，三者都維持 POR 預設
+（`SRAM4FWU=0`、`FLASHFWU=0`、ICACHE OFF），且 klipper 一路從 Flash
+執行（不是 SRAM2 執行），跟這一列條件精確吻合。`REGSEL`（LDO/SMPS
+選擇）同樣沒被韌體動過，維持 POR 預設 LDO，所以用 Table 74（LDO）不用
+Table 75（SMPS）。
 
-| 檔位 | 範圍 | 本輪結果 |
-|---|---|---|
-| 優 | `< 150 µs` | ✅ **兩組都落在這裡**（120.938 µs、119.875 µs） |
-| 中 | `150-320 µs` | 未觸及 |
-| 差 | `> 320 µs` | 未觸及 |
+這一列在 `STOPWUCK=1`（HSI16 喚醒）有精確數字，但 `STOPWUCK=0`
+（MSIS 4MHz 喚醒）**沒有剛好對應的列**——Table 74 這一列只列了
+`MSI 24 MHz`（Max 25.0µs）跟 `MSI 1 MHz`（Max 60.0µs）兩個 MSI 頻率，
+沒有 4MHz。用這兩個當上下界（假設 `tWUSTOP2` 隨喚醒時脈頻率單調變化
+——頻率愈低愈慢，這個假設 DS13086 沒有明講，但物理上合理，且跟
+`MSI 24MHz`（25.0µs）< `MSI 1MHz`（60.0µs）這個已知模式一致，沒有
+反例）：
 
-`restore_us` 這個已知分量本身遠低於 150µs 這個最寬鬆的判準，也遠低於
-C5 提過的 `wake_latency < 320µs` 整體判準——但因為 `tWUSTOP2` 未知，
-**還不能宣稱整個 `total_latency` 過了 320µs 這一關**，只能說「已知的
-`restore_us` 分量幫這個判準留出了約 200µs 的餘裕（320 − 120 ≈ 200µs）
-給未知的 `tWUSTOP2`」，這個餘裕夠不夠，要等真的拿到 datasheet 數字
-才能確認。
+| STOPWUCK | tWUSTOP2 (Max, µs) | restore_us (實測 max, µs) | total_latency max (µs) |
+|---|---|---|---|
+| `=1`（HSI16，Table74 精確列） | **25.0** | 96.625（`p400,c20`；`p100,c50` 為 94.562） | **121.625** |
+| `=0`（MSIS 4MHz，無精確列，用 MSI24MHz/MSI1MHz 當界） | **25.0 ~ 60.0**（界，非精確值） | 120.938（`p100,c50`；`p400,c20` 為 119.875） | **145.938 ~ 180.938** |
+
+### 三檔判讀（`total_latency` max，非僅 `restore_us`）
+
+| 檔位 | 範圍 | `STOPWUCK=1` | `STOPWUCK=0` |
+|---|---|---|---|
+| 優 | `< 150 µs` | ✅ **121.625 µs，確定落在這裡**（`tWUSTOP2` 是精確列） | ⚠️ 下界 145.938 µs 落在這裡，但上界 180.938 µs 不是——**卡在優/中邊界，因為 `tWUSTOP2(MSIS 4MHz)` 沒有精確值，無法確定** |
+| 中 | `150-320 µs` | 未觸及 | ⚠️ 若真實值接近上界，落在這裡 |
+| 差 | `> 320 µs` | 未觸及 | 未觸及（即使用最悲觀的上界 180.938µs 也遠低於 320µs） |
+
+**對 C5 的 `wake_latency < 320µs` 判準**：★ 兩種 `STOPWUCK` 設定、
+即使用最悲觀的界（`STOPWUCK=0` 上界 180.938µs），`total_latency` 都
+遠低於 320µs（只用掉判準的 57%），**這一關兩種設定都穩穩通過**，
+不需要 `tWUSTOP2(MSIS 4MHz)` 的精確值就能下這個結論。更細的優/中
+分級才需要精確值（見上表）。
 
 ### `STOPWUCK` 條件說明
 
@@ -312,7 +327,7 @@ $ sudo openocd ... -c "mdw 0x46020C1C" ...
 如實記錄、不強行解釋成雜訊或系統性效應。`s3` 的變化全部落在既有的
 PLL 鎖定抖動範圍內，沒有系統性差異。
 
-### ★★ `s0` 下降的意義：這只是「軟體可量段」的下降，不是淨收益
+### ★★ `s0` 下降的意義：軟體可量段的下降，淨收益見下方 DS13086 更新
 
 **`s0` 從 33.750µs 降到 8.438µs，這個下降完全發生在軟體可以用
 `DWT->CYCCNT` 量到的範圍內**——也就是「`wfi` 返回、`isb` 之後」到
@@ -330,8 +345,31 @@ Step 0 等待」裡的耗時，轉移到「軟體完全看不到的 `tWUSTOP2`�
 淨變化可能遠小於 `s0` 這 25.312µs 的降幅，甚至可能是零（如果
 `tWUSTOP2` 剛好多花了差不多的時間去起振 HSI16）。本測試只能量到
 `restore_us`（軟體可見段）的變化，***沒有辦法量到 `tWUSTOP2` 有沒有
-跟著變化，因此本測試無法給出 `STOPWUCK=1` 的淨收益，只能報告「軟體
-可見段減少了多少」這個片面數字***。
+跟著變化***。
+
+★ **DS13086 拿到後，這個問題不再是完全空白**（見第 5 節、第 7 節）：
+`STOPWUCK=1` 的 `tWUSTOP2` 有精確列（Table 74，Max 25.0µs），
+`STOPWUCK=0` 沒有精確列，只有 `MSI 24MHz`/`MSI 1MHz` 兩個界
+（25.0~60.0µs，假設隨頻率單調）。把兩種設定的 `total_latency` max
+算出來比較（第 5 節）：`STOPWUCK=1` 是 121.625µs；`STOPWUCK=0` 即使
+用**對它最有利**的下界（`tWUSTOP2=25.0µs`，跟 `STOPWUCK=1` 那列同一個
+數字，等於假設 MSIS 4MHz 跟 MSI 24MHz 一樣快，這是刻意偏袒
+`STOPWUCK=0` 的算法），也是 145.938µs——**比 `STOPWUCK=1` 的
+121.625µs 還高 24.3µs**。也就是說，即使把「`tWUSTOP2` 轉移」這個
+疑慮讓到最極端（假設轉移後的 `tWUSTOP2(MSIS 4MHz)` 跟 HSI16 那列一樣
+快），`s0` 省下來的 25.312µs 依然沒有被完全「吃回去」——**`STOPWUCK=1`
+的淨收益就 `total_latency` 的 max 而言是正的，不是「完全未知」**。
+
+這個結論仍有兩個限制，如實列出：
+1. 依賴「`tWUSTOP2` 隨喚醒時脈頻率單調」這個物理上合理但 DS13086
+   沒有明講的假設（見第 5 節）；
+2. `restore_us` 的 max 是本輪 70 次量測裡的軟體實測值，`tWUSTOP2` 的
+   Max 是 ST 的 characterization 規格值（3V、涵蓋溫度範圍），兩者的
+   統計基礎不完全對等，只是目前能湊出來最接近的比較。
+
+★★ 但這**不影響**下面 (A)/(B) 兩個假說的討論——那是「Stop2 睡眠期間
+HSI16 有沒有真的被關掉」的耗電問題，`total_latency` 的淨收益是延遲
+問題，兩者互相獨立，見下段。
 
 ### `s0` 恆為 135 cycles：兩種都能成立的解釋，本數據無法區分
 
@@ -364,6 +402,27 @@ Step 0 等待」裡的耗時，轉移到「軟體完全看不到的 `tWUSTOP2`�
 研究 `STOPWUCK`/`s0` 這種微秒級的延遲數字之前，應該先把 HSI16 真的
 關掉，那才是真正省電的地方，延遲數字反而是次要的。
 
+### ★ DS13086 `tSU(HSI16)`：支持 (A)，不是證明
+
+Table 82（`tsu(HSI16)`，DS13086 p.220）：**Typ 2.5µs、Max 3.6µs**——
+這是 HSI16 從關閉狀態起振到 ready 的時間。跟 `s0`（33.750µs，
+`STOPWUCK=0` 下量到，兩組、共 70 次一致）比：`tsu(HSI16)` 的 Max
+（3.6µs）只有 `s0` 的**約 1/9.4**（33.750 / 3.6 ≈ 9.4 倍）。
+
+這個數字**支持假說 (A)**：如果 HSI16 真的是從關閉狀態重新啟動
+（(A) 的前提），起振本身最多只要 3.6µs，遠比 135 cycles（33.750µs，
+@MSIS 4MHz）短——代表就算 (A) 成立，Step 0 迴圈前段的指令執行開銷
+（`RCC_CR |= HSI16ON` 到第一次檢查 `HSIRDY` 之間的指令）本身就足以
+「蓋過」整個起振時間，`HSIRDY` 檢查第一次就會過，跟本輪觀測到的
+「135 cycles 恆定、無抖動」一致。
+
+**但這不是證明**：(B)（HSI16 全程沒關）底下，`HSIRDY` 同樣會第一次
+就過，跟 (A) 的觀測結果**完全無法區分**——`tsu(HSI16)` 只是排除了
+「(A) 不成立是因為起振比 135 cycles 還久」這個反例，沒有辦法反過來
+證明 HSI16 真的有被關掉。區分 (A)/(B) 仍然需要上一段講的電流量測，
+`tsu(HSI16)` 只是讓 (A) 這個假說本身在時間量級上站得住腳，不再是
+純推測。
+
 ### G5 結論
 
 `STOPWUCK=1` 讓軟體可量段（`restore_us`，即 `s0+s1+s2+s3+s4`）的
@@ -389,53 +448,153 @@ Range 1 設定沒被清掉，Step 1 的 `VOSRDY`/`BOOSTRDY` 兩個輪詢理論�
 
 ---
 
-## 7. 外部規格缺口（DS13086）
+## 7. 外部規格缺口（DS13086）—— 已查到
 
 ### 狀態
 
-**DS13086 Rev 10（STM32U585 datasheet）未取得。** 嘗試從 st.com 的
-datasheet 資源端點自動下載，四種 `curl` 方式全部失敗（預設、
-`--http1.1`、HTTP/2 加瀏覽器 headers、HTTP/1.1 加瀏覽器 headers），
-分別以逾時、`HTTP/2 stream ... INTERNAL_ERROR`、再逾時收場——一般
-網路連線本身沒問題（google.com、st.com 首頁都正常回應），問題出在
-這個特定資源端點對非瀏覽器自動化請求的處理，很可能是 Akamai 反爬蟲
-機制擋下。詳見 [[2b_step0_lpuart_lse]] C1 的原始嘗試記錄。
+★ **DS13086 Rev 10（STM32U585 datasheet，2024 年 7 月）已由使用者手動
+下載並放到 `~/refs/DS13086_stm32u585ai.pdf`**（自動化下載當時走不通的
+原因——Akamai 反爬蟲擋下非瀏覽器 `curl` 請求——詳見
+[[2b_step0_lpuart_lse]] C1 的原始嘗試記錄，那份記錄本身保持不變，仍然
+正確描述「當時」的狀態）。用 `pdfinfo`/`pdftotext` 等等的 poppler-utils
+需要 `sudo apt install`、但沒有終端機密碼可用，改用已裝好的 Python
+`PyMuPDF`（`fitz`）套件抽取全文字（`doc.get_text()`），逐頁存成
+`~/refs/DS13086.txt`（350 頁）。**PDF 與 txt 都留在 `~/refs/`，不進
+repo。**
 
-**RM0456 Rev 7 是本系列文件目前唯一已查證的規格來源**，`refs/`
-目錄（PC 本機 `~/klipper/refs/`）只有 `rm0456.pdf`/`rm0456.txt` 跟
-CMSIS header，沒有任何 datasheet 檔案。
+版本確認（PDF 第 1/2/350 頁頁腳）：**`DS13086 Rev 10`，`July 2024`**。
 
-### 缺少的參數與受影響的結論
+**RM0456 Rev 7 仍是本系列文件另一個已查證的規格來源**，兩者互補：
+RM0456 給暫存器行為/公式，DS13086 給實際數字。
 
-| 參數 | DS13086 位置 | 受影響的結論 |
+### 查到的四張表（逐字引用，含頁碼）
+
+**Table 74. Low-power mode wake-up timings on LDO** (p.210-211)——本板
+`REGSEL` 沒被韌體動過，維持 POR 預設 LDO，所以用這張不用 Table 75
+（SMPS）。適用列：`twu(Stop 2)` / `All SRAMs retained` /
+`Wake-up in FLASH, SRAM4FWU=0 in PWR_CR2, ICACHE OFF`（理由見第 5 節）：
+
+| Conditions | Typ (3V,25°C) | Max (3V) |
 |---|---|---|
-| `tWUSTOP2` | Table 74/75 | `total_latency = tWUSTOP2 + restore_us` 無法給出完整數字（第 5 節），只能報告 `restore_us` 這個已知分量 |
-| `tWULPUART` | Table 77 | [[2b_step0_lpuart_lse]] A2 算出的 `BaudMax≈88.36 kbaud` 仍是 RM0456 自己的範例值（`tWULPUART=3µs`、HSI16 inaccuracy 1% 都是範例數字），沒有用 STM32U585 的實際規格值重算過 |
-| `tSU(HSI16)` | Table 82 | 沒有規格值可以驗證本文件第 6 節「`s0` 恆為 135 cycles」的 (A)/(B) 兩種假說——如果 `tSU(HSI16)` 的規格值本身就小於 Step 0 前段指令在 MSIS 4MHz 下的執行時間，會直接支持假說 (A)；反之則傾向假說 (B)，但目前完全沒有這個數字可以比對 |
-| `tSU(LSE)` | Table 81 | [[2b_step0_lpuart_lse]] part B 的 LSE 起振只有「≤0.5 秒（含 SWD 連線開銷）」這個實測上界，沒有規格書的典型值/最大值可以對照，不知道這次量到的「很快」是正常範圍還是board特例 |
+| MSI 24 MHz | 23.0 µs | 25.0 µs(2) |
+| HSI 16 MHz | 22.5 µs | 25.0 µs |
+| MSI 1 MHz | 57.0 µs | 60.0 µs |
 
-### 補齊方式
+（註 2：Tested in production at 130°C；其餘 typ/max 為 characterization
+值，非量產測試。**沒有 MSI 4MHz 這一列**——本板 `STOPWUCK=0` 用的正是
+MSIS 4MHz，DS13086 對這個精確頻率沒有直接數字，只能用 MSI 24MHz/
+MSI 1MHz 當界，細節與對 `total_latency` 的影響見第 5 節。）
 
-這四張表都需要真正的 datasheet 內容，自動化下載目前走不通，補齊方式：
+**Table 77. Wake-up time using USART/LPUART** (p.214)：
 
-1. 用一般瀏覽器（有 cookie/JS 執行能力，能通過反爬蟲機制）手動下載
-   DS13086 PDF。
-2. 放到 `~/refs/`（PC 本機，**不進 repo**，跟 `rm0456.txt`/
-   `stm32u585xx.h` 同一個目錄邏輯）。
-3. `pdftotext -layout DS13086_stm32u585ai.pdf DS13086.txt` 轉成文字。
-4. `grep -n -E "Table 7[4-7]\.|Table 8[12]\."` 之類的關鍵字定位這四張
-   表，逐字引用數值、條件、typ/max、頁碼，比照本系列文件對 RM0456 的
-   查證方式（附行號/頁碼，不推估、找不到就明說）。
+> `tWUUSART`/`tWULPUART`：「Wake-up time needed to calculate the maximum
+> USART/LPUART baud rate that is needed to wake up from Stop mode when
+> the USART/LPUART kernel clock source is HSI16/MSI.」Typ/Max 欄位是
+> `-`/`(2)`（無直接數字）。註 2：「This wake-up time is the HSI16
+> (see Table 82) or the MSI (see Table 83) oscillator maximum startup
+> time.」
 
-補齊後，第 5 節的 `total_latency` 三檔判讀、A2 的 `BaudMax`、第 6 節的
-(A)/(B) 假說，都需要用真實數字重新檢視一次結論是否還成立。
+即 `tWULPUART` 本身沒有獨立數字，**等於 Table 82 的 `tsu(HSI16)`**
+（本板 LPUART kernel clock 用的是 HSI16，不是 MSI，見
+[[2b_step0_lpuart_lse]] A1）。
+
+**Table 81. LSE oscillator characteristics** (p.219)：
+
+| Symbol | Parameter | Conditions | Min | Typ | Max | Unit |
+|---|---|---|---|---|---|---|
+| `tSU(LSE)`(4) | Startup time | VDD is stabilized | - | **2** | - | s |
+
+（註 4：「`tSU(LSE)` is the startup time measured from the moment it is
+enabled (by software) to a stabilized 32.768 kHz oscillation is reached.
+This value is measured for a standard crystal and it can vary
+significantly with the crystal manufacturer.」只有 Typ，沒有 Min/Max。）
+
+**Table 82. HSI16 oscillator characteristics** (p.220)：
+
+| Symbol | Parameter | Conditions | Min | Typ | Max | Unit |
+|---|---|---|---|---|---|---|
+| `fHSI16` | 出廠校準後頻率 | VDD=3.0V, TJ=30°C | 15.92 | 16 | 16.08 | MHz |
+| `fHSI16`(1) | | TJ=-10~100°C, 1.58≤VDD≤3.6V | 15.84 | - | 16.16 | MHz |
+| `tsu(HSI16)`(2) | HSI16 oscillator startup time | - | - | **2.5** | **3.6** | µs |
+| `tstab(HSI16)`(2) | HSI16 oscillator stabilization time | At 1% of target frequency | - | 4 | 6 | µs |
+
+（`fHSI16` 在 TJ=-10~100°C 這一列，15.84~16.16MHz 相對 16MHz 標稱值
+剛好是 **±1.0%**——跟 RM0456 A2 公式範例引用的「HSI inaccuracy 1%」
+精確吻合，代表那個「範例」數字其實就是這顆晶片延伸溫度範圍下的真實
+規格，不是隨便舉的例子。）
+
+### 受影響結論：重算
+
+**1. `tWUSTOP2` → 第 5 節 `total_latency`**：已用 Table 74 重算，兩種
+`STOPWUCK` 設定的 `total_latency` max 都遠低於 320µs 判準；`STOPWUCK=1`
+可以確定落在「優（<150µs）」檔，`STOPWUCK=0` 因為沒有精確的 MSIS
+4MHz 列，卡在優/中邊界，細節見第 5 節、第 6 節。
+
+**2. `tWULPUART` → [[2b_step0_lpuart_lse]] A2 的 `BaudMax`**：用
+`tsu(HSI16)` 真實值重算（公式不變：`Tbit min = tWULPUART / (11 ×
+DWUmax)`，`DWUmax = 3.41% - 1% = 2.41%`，`3.41%` 是 RM 公式本身的
+LPUART receiver tolerance 常數，`1%` 現在確認是真實規格見上）：
+
+| tWULPUART 取值 | Tbit min | BaudMax |
+|---|---|---|
+| RM0456 範例（3µs，舊版沿用） | 11.32 µs | 88.36 kbaud |
+| **DS13086 實際 Typ（2.5µs）** | 9.430 µs | **106.04 kbaud** |
+| **DS13086 實際 Max（3.6µs）** | 13.580 µs | **73.64 kbaud** |
+
+真實 Max 算出的 73.64 kbaud **比 RM 範例的 88.36 kbaud 還低**（margin
+更緊，不是更寬），[[2b_step0_lpuart_lse]] A2 對方案 (c) 在 250000 baud
+下直接用 HSI16 從關閉狀態喚醒的疑慮**不但沒有被真實數字打消，反而更
+嚴重**——250000 baud 是這個真實 `BaudMax` 上限的 **3.4 倍**（用 Max
+tWULPUART 算）到 2.35 倍（用 Typ 算）。[[2b_step0_lpuart_lse]] 的 C1
+交叉引用（「這四個參數 DS13086 才能補」）保持有效，只是現在這四個
+參數已經有真實數字可以代入，原文件本身不需要改，讀者跟著連結過來
+即可在這裡看到重算結果。
+
+**3. `tSU(HSI16)` → 第 6 節 (A)/(B) 假說**：`tsu(HSI16)` Max=3.6µs
+遠小於 `s0`=33.750µs（約 1/9.4），**支持假說 (A)**（`s0` 受指令執行
+時間所限，不是等振盪器）——但只是支持，不是證明，(A)/(B) 在這個
+數字下依然無法區分，需要電流量測才能分辨，細節見第 6 節新增小節。
+
+**4. `tSU(LSE)` → [[2b_step0_lpuart_lse]] part B 的「<0.5s」實測上界**：
+★ **這裡出現一個沒預期到的落差**：DS13086 的 `tSU(LSE)` Typ 是
+**2 秒**，比本輪實測的「<0.5 秒（含 SWD 連線開銷）」上界**慢了至少
+4 倍**——順序反過來了：規格書 typ 比實測上界還慢，不是「實測落在
+規格範圍內」這種正常情況。可能的原因（本輪都沒有進一步驗證，如實
+列出，不猜哪個對）：
+   - 這片板子的實際 LSE 晶體起振比「standard crystal」（datasheet 註
+     4 講的參考晶體）快，datasheet 自己也講 typ 值「can vary
+     significantly with the crystal manufacturer」；
+   - part B 量到的「<0.5s」可能量到的是 `LSERDY` 旗標第一次被設定的
+     時間點，不是 datasheet 定義的「stabilized 32.768kHz oscillation」
+     （旗標 ready 不一定等於真正穩定，兩者對「起振完成」的定義可能
+     不同）；
+   - part B 的量測方法本身含 SWD 連線開銷，精確度/取樣頻率可能不足以
+     抓到 2 秒等級的事件邊界（如果實際起振真的要 ~2s，量測方法有沒有
+     可能誤判成 <0.5s，本輪沒有覆核）。
+
+   **這個落差本身就是一個發現，需要在 [[2b_step0_lpuart_lse]] 未來
+   修訂時處理**（本檔案的任務範圍只更新這一份文件，不動
+   `2b_step0_lpuart_lse.md`，但交叉引用讀者需要知道這個矛盾存在，
+   不能只當作「實測比規格快，皆大歡喜」略過）。方案 (b)（LSE + 9600
+   動態切換）如果依賴「LSE 起振快」這個假設來安排切換時機，這個 4
+   倍落差是需要優先釐清的風險，比 `tWUSTOP2`/`tWULPUART` 兩項更
+   需要後續動作。
 
 ---
 
 ## 8. 我無法判定的事
 
-1. **`total_latency` 完整數字算不出來**：`tWUSTOP2` 這一段完全沒有
-   真實數字（DS13086 拿不到），只能報告 `restore_us` 這個已知分量。
+1. ~~`total_latency` 完整數字算不出來：`tWUSTOP2` 這一段完全沒有真實
+   數字（DS13086 拿不到），只能報告 `restore_us` 這個已知分量~~ ★
+   **DS13086 已取得，`STOPWUCK=1` 已有精確 `tWUSTOP2`（Table 74 HSI16
+   列，Max 25.0µs），`total_latency` max 算出來是 121.625µs**（第 5
+   節）。**仍無法判定的部分縮小為**：`STOPWUCK=0`（MSIS 4MHz）沒有
+   精確的 `tWUSTOP2` 列，只能用 MSI 24MHz/MSI 1MHz 當界
+   （25.0~60.0µs），導致 `total_latency` 卡在 145.938~180.938µs
+   之間，優/中兩檔判讀無法確定是哪一檔（雖然兩種可能都遠低於
+   320µs，這一關穩穩通過）。要縮小這個界，需要 ST 提供更細的頻率
+   對照表，或自行用示波器/邏輯分析儀直接量測 GPIO 翻轉時間點來抓
+   `tWUSTOP2` 本身，本輪都沒有做。
 2. **`s3`（PLL1 鎖定）的真實 `min`**：本輪只記錄了 `max`/`sum`，`min`
    沒有另外追蹤，只知道它存在（因為 `max>avg`），確切數值需要改韌體
    多加一個 `seg_min[5]` 才能量到。
@@ -446,10 +605,15 @@ CMSIS header，沒有任何 datasheet 檔案。
    幾乎沒變，如果换一個時間點/溫度再測一次，這種零抖動會不會被打破，
    沒有測過）。
 4. ~~`STOPWUCK=1` 的實際效果：只是列出來當作待測方向，本輪完全沒
-   實測~~ ★ **已在第 6 節（G5）測過，但淨收益依然未知**：`s0`（軟體
-   可見段）確實降了 25.312µs，但如第 6 節詳述，這個降幅有可能只是把
-   耗時轉移到量不到的 `tWUSTOP2` 裡，`total_latency` 的真正淨變化
-   本輪拿不到。另外，`HSI16` 精度不如校準過的振盪器、對開機初期時序
+   實測~~ ~~已在第 6 節（G5）測過，但淨收益依然未知~~ ★ **已在第 6 節
+   （G5）測過，DS13086 拿到後，淨收益從「完全未知」變成「max 而言
+   有正收益，但仍有兩個未消除的假設」**：`s0`（軟體可見段）降了
+   25.312µs，用 DS13086 的 `tWUSTOP2` 重算 `total_latency` max，
+   `STOPWUCK=1`（121.625µs）比 `STOPWUCK=0`（即使用最偏袒
+   `STOPWUCK=0` 的下界，145.938µs）低 24.3µs（第 5、6 節）——但這
+   依賴「`tWUSTOP2` 隨喚醒時脈頻率單調」的假設（DS13086 沒明講），
+   且是拿軟體實測 max 跟規格書 characterization Max 比，兩者統計基礎
+   不完全對等。另外，`HSI16` 精度不如校準過的振盪器、對開機初期時序
    穩定性有沒有影響，這點本輪也還是沒測——G5 只跑了 70 次（跟 G3
    對等的兩組），樣本數不足以看出這種精度問題可能造成的長尾影響。
 5. **這組數字的代表性**：只在同一塊板子、同一次連續測試（兩組合計

@@ -187,7 +187,7 @@ PLL 鎖定，跟睡眠時長無關，只跟「醒來那一刻開始，要重建 
 ## 5. `total_latency` 與判讀
 
 ★ **DS13086 Rev 10（July 2024）已取得**，`tWUSTOP2` 不再是空白，見
-第 7 節完整查表記錄。本節用查到的數字重算。
+第 8 節完整查表記錄。本節用查到的數字重算。
 
 ```
 total_latency = tWUSTOP2（DS13086 Table 74，LDO，該列 Max）
@@ -347,7 +347,7 @@ Step 0 等待」裡的耗時，轉移到「軟體完全看不到的 `tWUSTOP2`�
 `restore_us`（軟體可見段）的變化，***沒有辦法量到 `tWUSTOP2` 有沒有
 跟著變化***。
 
-★ **DS13086 拿到後，這個問題不再是完全空白**（見第 5 節、第 7 節）：
+★ **DS13086 拿到後，這個問題不再是完全空白**（見第 5 節、第 8 節）：
 `STOPWUCK=1` 的 `tWUSTOP2` 有精確列（Table 74，Max 25.0µs），
 `STOPWUCK=0` 沒有精確列，只有 `MSI 24MHz`/`MSI 1MHz` 兩個界
 （25.0~60.0µs，假設隨頻率單調）。把兩種設定的 `total_latency` max
@@ -448,7 +448,149 @@ Range 1 設定沒被清掉，Step 1 的 `VOSRDY`/`BOOSTRDY` 兩個輪詢理論�
 
 ---
 
-## 7. 外部規格缺口（DS13086）—— 已查到
+## 7. G6：直接讀 `RCC_CR` 判定 HSI16 在 Stop2 期間是否真的關掉
+
+延續第 6 節「`s0` 恆為 135 cycles：兩種都能成立的解釋」——(A)/(B) 兩個
+假說單靠 CYCCNT 無法區分，需要在 `wfi` 醒來瞬間、任何軟體寫入
+`RCC_CR` 之前，直接讀這顆暫存器的原始值才能判定。
+
+### 韌體改動
+
+`src/stm32/stm32u5_lowpower.c`：`struct stop2_status` 新增
+`cr_at_wake` 欄位；`stop2_once()` 在
+
+```c
+__asm volatile ("isb" ::: "memory");
+c0 = DWT->CYCCNT;
+s_status.cr_at_wake = U5_RCC_CR;   /* 必須在 stm32u5_sysclk_restore()
+                                     * 之前，否則讀到的是 restore 後的
+                                     * 狀態，毫無意義 */
+IWDG->KR = 0xAAAA;
+```
+
+這個時間點插入讀取——比 `c0` 晚一行、比 `stm32u5_sysclk_restore()`
+（第一次寫 `RCC_CR` 的地方，Step 0 的 `HSI16ON`）早，中間沒有任何會
+碰 `RCC_CR` 的程式碼，讀到的確定是「進 Stop2 之前 `RCC_CR` 是什麼、
+醒來後硬體自己變成什麼」的原始快照，不受軟體介入汙染。
+`command_test_stop2()` 用 `cr_first`/`cr_last`（只採信 `!entry_fail`
+輪次）在跑完整組 `cycles` 後送一則 `sendf("stop2_cr first=%u
+last=%u")`。Build（板子 `unoq:~/klipper`，`text +97 / bss +4` bytes，
+`bss` 精確對應新增的一個 `uint32_t` 欄位）、燒錄（`openocd program
+... verify reset`，`** Verified OK **`）、版本字串
+`v0.13.0-474-ge9985ad22-dirty-20260923_141448-hunter`，過程見
+`docs/build_environment.md`（build 環境本身這輪才第一次搞清楚必須在
+板子上，跟本次量測內容分開記錄）。
+
+### RM0456 Rev 7 §11.8.1 RCC_CR 欄位位置（逐字查證，附行號）
+
+★ 使用者一開始給的位元假設（`HSION=bit0`/`HSIKERON=bit1`/
+`HSIRDY=bit2`）**是舊系列（如 F1/F4）的排法，STM32U5 不適用**，已在
+上一輪查證並更正：
+
+| Bit | 名稱 | RM0456 行號 |
+|---|---|---|
+| 25 | PLL1RDY | 34370 |
+| 24 | PLL1ON | 34385 |
+| 10 | HSIRDY | 34466 |
+| 9 | HSIKERON | 34473 |
+| 8 | HSION | 34481 |
+| 2 | MSISRDY | 34542 |
+| 1 | MSIKERON | 34549 |
+| 0 | MSISON | 34557 |
+
+（`src/stm32/stm32u5.c` 的既有程式碼本身就用對了：`U5_RCC_CR |= (1u
+<< 8)` 設 `HSION`、`U5_RCC_CR & (1u << 10)` 查 `HSIRDY`——跟這張表
+完全吻合，佐證這張表沒抄錯。）
+
+### 量測結果：`STOPWUCK=0`，`test_stop2 period_ms=100 cycles=10`
+
+```
+$ ssh unoq '... console.py -b 250000 /dev/ttyHS1'
+009.546-012.713: stop2_status cycle=1..10（全部 sws=3 pll1rdy=1
+                  restore_timeout=0 lptim_timeout=0 entry_fail=0）
+012.966: stop2_lat_max n=10 s0=148 s1=799 s2=41 s3=476 s4=55
+012.966: stop2_lat_sum n=10 s0=1480 s1=7990 s2=410 s3=4475 s4=550
+012.966: stop2_cr first=1333 last=1333
+```
+
+`cr_first`/`cr_last`（十進位 `1333` = **`0x535`**）10 輪完全一致，
+逐位元解讀：
+
+| Bit | 名稱 | 值 | 意義 |
+|---|---|---|---|
+| **10** | **HSIRDY（主判準）** | **1** | HSI16 在醒來瞬間、`stm32u5_sysclk_restore()` 還沒跑之前，**已經是 ready** |
+| 8 | HSION | 1 | HSI16 enable 已經是設定狀態 |
+| 9 | HSIKERON | 0 | 不是「周邊 kernel clock 強制常駐」這條路徑撐著（排除一種可能機制） |
+| 0 | MSISON | 1 | MSIS enable（`STOPWUCK=0` 對應的喚醒時脈，正常） |
+| 2 | MSISRDY | 1 | MSIS ready（正常；`MSISRDY=0` 的異常情境**沒有觸發**，不需要先查 `STOPWUCK` 是否意外停在 1） |
+| 24 | PLL1ON | 0 | PLL1 關閉（符合預期） |
+| 25 | PLL1RDY | 0 | PLL1 未鎖（符合預期，**沒有觸發「醒來當下 PLL1RDY=1」的異常情境**） |
+
+`get_uptime`：`uptime high=1`（睡前）→`uptime high=2`（10 輪測完後），
+單調遞增，**沒有觀察到重置**。
+
+### 結論：假說 (B) 成立——HSI16 在 Stop2 睡眠期間全程沒有關閉
+
+`HSIRDY=1` 是在**任何軟體寫入 `RCC_CR` 之前**讀到的，`c0`→這行讀取
+之間沒有一行程式碼碰過 `RCC_CR`，所以這不可能是「硬體剛啟動 HSI16、
+碰巧這麼快就 ready」——起振（`tsu(HSI16)` max 3.6µs，DS13086 Table
+82）遠遠不夠快到在 `isb` 後、下一行讀取前的幾個 cycle 內完成，若
+HSI16 真的是這一刻才被誰打開，`HSIRDY` 不可能這麼快就是 1。唯一合理
+解釋：**HSI16 從進入 Stop2 之前就已經是 on/ready，整段 Stop2 睡眠期間
+沒有被硬體關掉，睡醒直接維持原狀**——這正是第 6 節列出的假說 (B)。
+
+**機制層級的根本原因**（回頭查 `stop2_once()`/`stm32u5_sysclk_bringup()`
+證實）：`stm32u5_sysclk_bringup()`（`stm32u5.c` Step 0）冷開機時執行
+`U5_RCC_CR |= (1u << 8)` 把 `HSION` 設起來去鎖 PLL1，**之後全程沒有
+任何地方把它清掉**；`stop2_once()` 的 Stop2 進入序列只寫
+`PWR_CR1`/`SCB_SCR`/`LPTIM1`/`SysTick`，完全沒有碰 `RCC_CR`。硬體
+規格上（RM0456 行 34481-34489，`HSION` 說明）「cleared by hardware
+to stop the HSI16 oscillator when entering Stop, Standby, or Shutdown
+mode」——**這句話講的是 Standby/Shutdown 才會被硬體自動清掉，Stop
+（含 Stop2）不在這個自動清除清單裡**，所以只要軟體自己不主動清
+`HSION`，HSI16 在 Stop2 期間就會維持原狀繼續跑，這正是本輪觀測到的
+現象，機制上完全講得通，不是巧合。
+
+★ 假說 (A)（`s0` 純粹是指令執行開銷、HSI16 真的有被關掉）**不成立**：
+第 6 節原本用 `tsu(HSI16)` 遠小於 `s0` 來「支持」(A)，但那只是排除
+「起振比 135 cycles 還久」這個反例，本身無法區分 (A)/(B)；現在有了
+直接的暫存器證據，可以正式**推翻** (A)、**確認** (B)。
+
+### 對方案 (c) 的意涵
+
+回到 [[2b_step0_lpuart_lse]] 方案 (c)（HSI16 按需喚醒、Stop2 期間維持
+250000 baud LPUART）與 A2 的 `BaudMax` 疑慮：**`BaudMax` 這個限制的
+前提是「HSI16 從關閉狀態重新啟動，起振時間要跟 bit period 賽跑」**
+（`tWULPUART` = HSI16 從關閉到 ready 的最大起振時間，DS13086 Table
+77/82）——本輪確認 (B) 成立後，這個前提在**目前這份韌體**上不成立：
+**HSI16 在 Stop2 睡眠期間根本沒關過，喚醒當下已經是 ready 狀態，沒有
+起振時間可等，`BaudMax` 這個算式（第 8 節重算的 73.64~106.04 kbaud）
+不適用於「這顆晶片這樣用」的實際情況**，250000 baud 在這個前提下沒有
+`tWULPUART` 這個限制要擔心。
+
+但這不是免費的——**代價是睡眠電流被墊高**：DS13086 Table 82
+`IDD(HSI16)`（HSI16 oscillator power consumption）Typ **150µA**、Max
+**210µA**，這是本輪之前完全沒討論過的一筆持續電流消耗，Stop2 睡眠
+期間全程都在付，不是喚醒瞬間的一次性成本。這**必須另行量測**才能
+知道對整體睡眠電流預算的影響有多大（Stop2 全模式的目標電流通常是
+µA 級，150-210µA 的 HSI16 常駐消耗有可能是主要甚至壓倒性的一項，
+但本輪只查到 DS13086 的規格值，沒有用電流表/示波器實測過整個板子
+的 Stop2 睡眠電流，這筆帳目前只有理論上界，沒有實測數字）。
+
+**後續行動建議**（本輪不做，列為待辦）：
+1. 如果 2B 的目標是壓低 Stop2 睡眠電流，在 `stop2_once()` 進入 Stop2
+   前主動清掉 `RCC_CR` 的 `HSION`（如果沒有其他周邊在用 HSI16 kernel
+   clock），退出後在 Step 0 重新設定——這樣 (A) 的路徑才會真的發生，
+   但這樣一來原本方案 (c) 的 `BaudMax` 限制（73.64~106.04 kbaud <
+   250000 baud）又會重新浮現，等於是「延遲/風險」vs「睡眠電流」的
+   取捨，需要先量到實際睡眠電流數字才能判斷這個取捨值不值得。
+2. 用電流表/示波器直接量 Stop2 睡眠期間的實際電流，跟
+   `IDD(HSI16)` Max 210µA 對照，確認這筆消耗是否真的存在、量級是否
+   吻合規格值。
+
+---
+
+## 8. 外部規格缺口（DS13086）—— 已查到
 
 ### 狀態
 
@@ -551,9 +693,14 @@ tWULPUART 算）到 2.35 倍（用 Typ 算）。[[2b_step0_lpuart_lse]] 的 C1
 即可在這裡看到重算結果。
 
 **3. `tSU(HSI16)` → 第 6 節 (A)/(B) 假說**：`tsu(HSI16)` Max=3.6µs
-遠小於 `s0`=33.750µs（約 1/9.4），**支持假說 (A)**（`s0` 受指令執行
-時間所限，不是等振盪器）——但只是支持，不是證明，(A)/(B) 在這個
-數字下依然無法區分，需要電流量測才能分辨，細節見第 6 節新增小節。
+遠小於 `s0`=33.750µs（約 1/9.4），當時只能講「**支持假說 (A)**」
+（`s0` 受指令執行時間所限，不是等振盪器）——但只是支持，不是證明，
+單靠這個數字 (A)/(B) 依然無法區分，需要電流量測才能分辨。★ **這個
+問題後來在第 7 節（G6）用直接讀 `RCC_CR` 的方式解決了**：喚醒瞬間
+`HSIRDY=1`（任何軟體寫入之前），證實 (B) 成立、(A) 不成立——`tsu
+(HSI16)` 這個數字本身沒有錯，只是問錯了問題方向：`s0` 短並不是因為
+HSI16 起振快，而是因為 HSI16 根本沒關過，`s0` 全程都是指令執行開銷，
+跟「等不等振盪器」無關。
 
 **4. `tSU(LSE)` → [[2b_step0_lpuart_lse]] part B 的「<0.5s」實測上界**：
 ★ **這裡出現一個沒預期到的落差**：DS13086 的 `tSU(LSE)` Typ 是
@@ -582,7 +729,7 @@ tWULPUART 算）到 2.35 倍（用 Typ 算）。[[2b_step0_lpuart_lse]] 的 C1
 
 ---
 
-## 8. 我無法判定的事
+## 9. 我無法判定的事
 
 1. ~~`total_latency` 完整數字算不出來：`tWUSTOP2` 這一段完全沒有真實
    數字（DS13086 拿不到），只能報告 `restore_us` 這個已知分量~~ ★
@@ -619,3 +766,11 @@ tWULPUART 算）到 2.35 倍（用 Typ 算）。[[2b_step0_lpuart_lse]] 的 C1
 5. **這組數字的代表性**：只在同一塊板子、同一次連續測試（兩組合計
    70 次）裡量到，沒有跨 session、跨溫度、跨板卡的重複驗證，
    不確定是否能代表這顆晶片/這個設計的通用行為。
+6. ~~`s0` 恆為 135 cycles 是 (A) 還是 (B)：CYCCNT 數字無法區分，需要
+   電流量測~~ ★ **已在第 7 節（G6）用直接讀 `RCC_CR` 解決，(B) 成立
+   （`HSIRDY=1` 在任何軟體寫入之前），不需要電流量測就能判定 A/B**。
+   但 (B) 成立之後帶出**新的、本輪同樣沒量到的缺口**：DS13086
+   `IDD(HSI16)` Typ 150µA/Max 210µA 只是規格書上界，**Stop2 睡眠期間
+   實際多耗掉多少電流、佔整體睡眠電流預算多大比例，本輪完全沒有用
+   電流表/示波器實測過**，第 7 節列為待辦，這是目前最貼近 2B 能效
+   主題、但還沒有任何實測數字的一塊。

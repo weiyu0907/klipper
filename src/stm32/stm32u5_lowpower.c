@@ -128,6 +128,12 @@ struct stop2_status {
      * 一刻切到 PLL1R，但切換動作本身只佔極少數 cycle，換算時仍按
      * HSI16 概算，見文件換算段的說明）。 */
     uint32_t s0, s1, s2, s3, s4;
+    /* 2B G6：wfi 醒來瞬間（isb 之後、stm32u5_sysclk_restore() 之前，
+     * 任何 HSI16ON 寫入都還沒發生）的 RCC_CR 原始快照，用來判定
+     * HSI16 在 Stop2 睡眠期間是否真的被硬體關掉（見 (A)/(B) 假說，
+     * docs/2b_g_wake_latency.md 第 6 節）。entry_fail 路徑從未進
+     * wfi，這個欄位維持前一輪的殘值，呼叫端只採信 !entry_fail 的輪次。 */
+    uint32_t cr_at_wake;
 };
 static struct stop2_status s_status;
 
@@ -368,6 +374,10 @@ void stop2_once(void)
     __asm volatile ("wfi");
     __asm volatile ("isb" ::: "memory");
     c0 = DWT->CYCCNT;       /* 2B G：wfi 醒來瞬間的 cycle 快照，喚醒時脈下計數 */
+    s_status.cr_at_wake = U5_RCC_CR;  /* 2B G6：必須在任何 HSI16ON 寫入
+                                        * 之前，即 stm32u5_sysclk_restore()
+                                        * 呼叫之前，否則讀到的是 restore
+                                        * 後的狀態，毫無意義。 */
     IWDG->KR = 0xAAAA;     /* 醒來立刻餵，在 sysclk_restore() 之前 */
 
     /* 醒來的第一件事永遠是拆除 SLEEPDEEP/LPMS，而不是先做時鐘還原。
@@ -444,6 +454,10 @@ command_test_stop2(uint32_t *args)
     uint32_t agg_n = 0;
     uint32_t seg_max[5] = {0, 0, 0, 0, 0};
     uint32_t seg_sum[5] = {0, 0, 0, 0, 0};
+    /* 2B G6：第一輪與最後一輪（皆限 !entry_fail）的 wfi 醒來瞬間
+     * RCC_CR 快照，判定 HSI16 在 Stop2 睡眠期間有沒有被關掉。 */
+    uint32_t cr_first = 0, cr_last = 0;
+    uint32_t cr_have_first = 0;
 
     if (period_ms == 0 || period_ms > 2000)
         period_ms = 2000;              /* LPTIM1 ARR 16bit/32kHz 上限 */
@@ -481,6 +495,12 @@ command_test_stop2(uint32_t *args)
                 seg_sum[k] += seg[k];
             }
             agg_n++;
+
+            if (!cr_have_first) {
+                cr_first = s_status.cr_at_wake;
+                cr_have_first = 1;
+            }
+            cr_last = s_status.cr_at_wake;
         }
 
         /* restore_timeout 或 SWS 不是 PLL1R：終止態，中止後續 cycles，
@@ -500,5 +520,7 @@ command_test_stop2(uint32_t *args)
     sendf("stop2_lat_sum n=%u s0=%u s1=%u s2=%u s3=%u s4=%u"
           , agg_n, seg_sum[0], seg_sum[1], seg_sum[2], seg_sum[3]
           , seg_sum[4]);
+
+    sendf("stop2_cr first=%u last=%u", cr_first, cr_last);
 }
 DECL_COMMAND(command_test_stop2, "test_stop2 period_ms=%u cycles=%u");

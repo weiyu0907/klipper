@@ -88,8 +88,14 @@ void lpuart1_handler(void);
 
 #define USART_ISR_RXNE   0x0020U   // FIFOEN=1 時同一個 bit 代表 RXFNE
 #define USART_ISR_TXE    0x0080U
-#define USART_ISR_ORE    0x0008U
+#define USART_ISR_FE     0x0002U   // ISR bit1，RM0456 行 189346
+#define USART_ISR_NE     0x0004U   // ISR bit2，RM0456 行 189336
+#define USART_ISR_ORE    0x0008U   // ISR bit3，RM0456 行 189323（OVRDIS=1 時永遠鎖 0，行 189329-189331）
 #define USART_ISR_TC     0x0040U   // ISR bit6，RM0456 行 189273
+#define USART_ISR_RXFT   0x04000000U // ISR bit26，RM0456 行 189140
+#define USART_ICR_FECF   0x0002U   // ICR bit1，RM0456 行 189639
+#define USART_ICR_NECF   0x0004U   // ICR bit2，RM0456 行 189636
+#define USART_ICR_ORECF  0x0008U   // ICR bit3，RM0456 行 189623
 #define USART_CR1_UE     0x0001U
 #define USART_CR1_UESM   0x0002U   // CR1 bit1，RM0456 行 188386
 #define USART_CR1_RE     0x0004U

@@ -13,11 +13,16 @@
 // ══════════════════════════════════════════════════════════════════
 // ★★★ 板上測試前必讀，不照做測試會被 klippy 中途砍掉 ★★★
 // ══════════════════════════════════════════════════════════════════
-// Stop2 期間核心時脈停止，DWT->CYCCNT 與所有以它為底的計時全部凍結；
-// 更關鍵的是 LPUART1 在 Stop2 下也是死的（本里程碑刻意不設它的
-// APB3SMENR/SRDAMR 自主模式時脈閘，範圍只到 LPTIM1）。若 klipper.service
-// 仍在跑，host 端每秒一次的 get_clock 收不到回應，MCU 只要睡超過
-// klipper 的逾時門檻（通常一兩百毫秒），host 就會判定 "Lost
+// Stop2 期間核心時脈停止，DWT->CYCCNT 與所有以它為底的計時全部凍結。
+// ★ 2B step2 Phase 1 之後這裡不再是「LPUART1 在 Stop2 下也是死的」
+// ——serial_init()（stm32f0_serial.c）現在會設 UESM/FIFOEN/RXFTIE 跟
+// APB3SMENR/SRDAMR 的 LPUART1 位元，LPUART1 在 Stop2 下能透過
+// autonomous mode 收資料、喚醒 MCU（docs/2b_step2_impl_spec.md）。
+// 但下面這條限制依然成立、原因不同：即使 LPUART1 能喚醒 MCU，
+// console.py 不會跑 clocksync，Stop2 睡眠期間 CYCCNT 停擺會讓
+// clocksync 的時間基準失準（這是 step 3 才要解決的），若 klipper.
+// service 仍在跑，host 端每秒一次的 get_clock 收不到回應，MCU 只要
+// 睡超過 klipper 的逾時門檻（通常一兩百毫秒），host 就會判定 "Lost
 // communication with MCU" 並重啟韌體——測試會在中途被砍掉，而且
 // 症狀會被誤判成 Stop2 本身壞掉，其實只是 host 端逾時重啟。
 //
@@ -134,6 +139,16 @@ struct stop2_status {
      * docs/2b_g_wake_latency.md 第 6 節）。entry_fail 路徑從未進
      * wfi，這個欄位維持前一輪的殘值，呼叫端只採信 !entry_fail 的輪次。 */
     uint32_t cr_at_wake;
+    /* 2B c1 Phase 2：wfi 前等待 TC=1 是否逾時（0=正常送完，1=逾時，
+     * 逾時上限沿用 U5_WAIT_LOOPS，不是另外發明新常數，見
+     * docs/2b_step2_impl_spec.md 第 2 節）。 */
+    uint32_t tc_timeout;
+    /* 2B c1 Phase 2：isb 之後、任何旗標清除之前的 LPUART1->ISR/
+     * LPTIM1->ISR 快照，用來判定這輪是被 LPUART（RXFT/RXFNE）還是
+     * LPTIM1（ARRM）喚醒的，或兩者皆有。entry_fail 路徑跟 cr_at_wake
+     * 一樣維持前一輪殘值，呼叫端只採信 !entry_fail 的輪次。 */
+    uint32_t uart_isr_at_wake;
+    uint32_t lptim_isr_at_wake;
 };
 static struct stop2_status s_status;
 
@@ -369,6 +384,25 @@ void stop2_once(void)
      * 「根本沒進 Stop2」最關鍵的一行。
      * isb：wfi 醒來後立刻沖刷管線，確保接下來抓到的指令流反映喚醒
      * 後的真實狀態，而不是深度睡眠前殘留的預取結果。 */
+    /* 2B c1 Phase 2：進 Stop2 前確認 TX 已送完（TC=1），避免 Stop2
+     * 期間 peripheral clock 被切斷、截斷最後一筆傳輸（RM0456 行
+     * 183305-183310：「Software must wait until TC = 1」）。逾時上限
+     * 沿用既有的 U5_WAIT_LOOPS（跟檔案裡其他忙等一致，不是另外發明
+     * 一個新常數）——這裡 CPU 跑在 PLL1R 160MHz（進 Stop2 前的正常
+     * 運行時脈），200000 次迴圈大約落在低毫秒等級（粗估，非實測值：
+     * 每圈抓 3-4 個 cycle，200000×4/160MHz≈5ms），對一個 byte 只要
+     * 40µs（250000 baud）的傳輸來說是非常寬鬆的上限，不會誤判正常
+     * 情況為逾時。逾時不阻擋、不是致命錯誤，只計數回報
+     * （docs/2b_step2_impl_spec.md 第 0、2 節的 tc_timeout 需求）。 */
+    {
+        volatile uint32_t j;
+        for (j = 0; j < U5_WAIT_LOOPS; j++) {
+            if (LPUART1->ISR & USART_ISR_TC)
+                break;
+        }
+        s_status.tc_timeout = (j >= U5_WAIT_LOOPS) ? 1u : 0u;
+    }
+
     IWDG->KR = 0xAAAA;     /* 睡前餵飽，讓倒數從滿格開始（見限制 A/B 說明） */
     __asm volatile ("dsb" ::: "memory");
     __asm volatile ("wfi");
@@ -378,6 +412,17 @@ void stop2_once(void)
                                         * 之前，即 stm32u5_sysclk_restore()
                                         * 呼叫之前，否則讀到的是 restore
                                         * 後的狀態，毫無意義。 */
+    /* 2B c1 Phase 2：喚醒來源判定——必須在任何清旗標動作之前擷取，
+     * 否則會看到「已經被清過」的假象。RXFT/RXFNE 之後靠 irq_enable()
+     * 讓真正的 ISR 讀 RDR 排空自動清（見檔案後段的稽核），這裡只讀
+     * 不動它們；FE/NE/ORE 是跟特定字元綁定的錯誤旗標（RM0456 行
+     * 189323-189365），必須寫 ICR 才會清，讀完立刻清掉，讓每一輪的
+     * 統計只反映「這一輪」新發生的錯誤，不會被前幾輪的殘值疊加。
+     * OVRDIS=1 讓 ORE 永遠鎖 0（RM0456 行 189329-189331），這裡照樣
+     * 清是為了邏輯一致，不是預期它真的會被設起來。 */
+    s_status.uart_isr_at_wake  = LPUART1->ISR;
+    s_status.lptim_isr_at_wake = U5_LPTIM1_ISR;
+    LPUART1->ICR = USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;
     IWDG->KR = 0xAAAA;     /* 醒來立刻餵，在 sysclk_restore() 之前 */
 
     /* 醒來的第一件事永遠是拆除 SLEEPDEEP/LPMS，而不是先做時鐘還原。
@@ -458,6 +503,11 @@ command_test_stop2(uint32_t *args)
      * RCC_CR 快照，判定 HSI16 在 Stop2 睡眠期間有沒有被關掉。 */
     uint32_t cr_first = 0, cr_last = 0;
     uint32_t cr_have_first = 0;
+    /* 2B c1 Phase 2：TC 逾時計數、喚醒來源分類（!entry_fail 輪次）、
+     * FE/NE/ORE 錯誤旗標累計（整個測試期間）。 */
+    uint32_t tc_timeout_n = 0;
+    uint32_t wake_by_uart = 0, wake_by_lptim = 0, wake_both = 0;
+    uint32_t err_fe = 0, err_ne = 0, err_ore = 0;
 
     if (period_ms == 0 || period_ms > 2000)
         period_ms = 2000;              /* LPTIM1 ARR 16bit/32kHz 上限 */
@@ -501,6 +551,34 @@ command_test_stop2(uint32_t *args)
                 cr_have_first = 1;
             }
             cr_last = s_status.cr_at_wake;
+
+            tc_timeout_n += s_status.tc_timeout;
+
+            /* 2B c1 Phase 2：喚醒來源分類。uart_wake/lptim_wake 都是 0
+             * 的情況（旗標全空卻醒了）本輪的 sendf 格式沒有專門欄位，
+             * 會反映在 agg_n != by_uart+by_lptim+both 這個差值上，
+             * 分析時要注意檢查，不能只看這三個數字加起來對不對。 */
+            {
+                uint32_t uart_wake = (s_status.uart_isr_at_wake
+                                       & (USART_ISR_RXNE | USART_ISR_RXFT))
+                                      != 0;
+                uint32_t lptim_wake = (s_status.lptim_isr_at_wake
+                                        & (1u << 1)) != 0;  /* ARRM */
+
+                if (uart_wake && lptim_wake)
+                    wake_both++;
+                else if (uart_wake)
+                    wake_by_uart++;
+                else if (lptim_wake)
+                    wake_by_lptim++;
+            }
+
+            if (s_status.uart_isr_at_wake & USART_ISR_FE)
+                err_fe++;
+            if (s_status.uart_isr_at_wake & USART_ISR_NE)
+                err_ne++;
+            if (s_status.uart_isr_at_wake & USART_ISR_ORE)
+                err_ore++;
         }
 
         /* restore_timeout 或 SWS 不是 PLL1R：終止態，中止後續 cycles，
@@ -522,5 +600,9 @@ command_test_stop2(uint32_t *args)
           , seg_sum[4]);
 
     sendf("stop2_cr first=%u last=%u", cr_first, cr_last);
+
+    sendf("stop2_wake n=%u by_uart=%u by_lptim=%u both=%u tc_timeout=%u"
+          , agg_n, wake_by_uart, wake_by_lptim, wake_both, tc_timeout_n);
+    sendf("stop2_err fe=%u ne=%u ore=%u", err_fe, err_ne, err_ore);
 }
 DECL_COMMAND(command_test_stop2, "test_stop2 period_ms=%u cycles=%u");

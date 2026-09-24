@@ -40,6 +40,8 @@ void sched_try_shutdown(uint_fast8_t reason);
 void sched_shutdown(uint_fast8_t reason) __noreturn;
 void sched_report_shutdown(void);
 void sched_main(void);
+uint32_t sched_timer_peek(void);
+uint32_t sched_timer_peek_budget(uint32_t now, uint32_t max_ticks);
 
 // Compiler glue for DECL_X macros above.
 #define _DECL_CALLLIST(NAME, FUNC)                                      \

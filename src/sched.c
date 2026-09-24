@@ -189,6 +189,90 @@ sched_timer_reset(void)
     timer_kick();
 }
 
+// ---- Idle-sleep budget query (2B step 4, docs/2b_step4_timer_peek.md) ----
+//
+// Peek the waketime of the earliest scheduled timer without
+// dispatching it. timer_list is kept sorted by ascending waketime at
+// all times (see insert_timer()/sched_add_timer() above), so
+// SchedStatus.timer_list always already points at the soonest timer
+// -- no scan is needed, and none should be added here.
+//
+// Safety note on the sched_del_timer() head-delete path above: when
+// the head timer is deleted, deleted_timer.waketime is set to the
+// *deleted* timer's own (now-stale) waketime, not the new head's.
+// Because the list is kept sorted, the deleted timer's waketime can
+// never be later than the real new head's waketime -- so a peek
+// taken in that narrow window can only under-report the next
+// deadline, never over-report it. Under-reporting just means "the
+// caller may wake up earlier than strictly necessary" (safe);
+// over-reporting would mean "sleep past a real deadline", which is
+// exactly what trips the "Rescheduled timer in the past" shutdown in
+// armcm_timer.c's timer_dispatch_many().
+//
+// Usage contract: the return value is only valid inside the same
+// irq-disabled (PRIMASK=1) section the caller uses to decide how long
+// to sleep and to actually enter wfi. sched_add_timer()/
+// sched_del_timer() both use irq_save()/irq_restore() internally,
+// meaning either may run from task or IRQ context at any moment
+// interrupts are enabled -- if the caller re-enables interrupts
+// between the peek and entering wfi, a newly-added timer could
+// require waking sooner than this value reflects, and sleeping on
+// that stale budget risks the same "Rescheduled timer in the past"
+// shutdown described above.
+uint32_t
+sched_timer_peek(void)
+{
+    return SchedStatus.timer_list->waketime;
+}
+
+// Return the number of ticks from 'now' until the next scheduled
+// timer is due, clamped to 'max_ticks'. Returns 0 if already due or
+// overdue. Uses timer_is_before() (not raw subtraction) so the result
+// stays correct across a 32-bit wraparound of the tick counter.
+//
+// This is the *raw scheduling-layer* budget only -- it does not know
+// about, and does not subtract, any platform-level wake latency (for
+// example STM32U5 Stop2's tWUSTOP2 + restore_us, measured ~121-181us
+// depending on STOPWUCK, see docs/2b_g_wake_latency.md) or any safety
+// margin on top of that. The caller must subtract those itself before
+// deciding how long to actually sleep -- this file has no knowledge
+// of what platform it is compiled for, and wake latency is a
+// platform-layer concern, not a scheduling-layer one.
+//
+// 'max_ticks' lets the caller impose its own ceiling (for example an
+// IWDG timeout budget of roughly 0.5s, or a receive_buf-drain budget,
+// see docs/2b_step2_t4_overflow.md) -- this function does not decide
+// that cap, the caller does, per platform-specific constraints this
+// file has no visibility into.
+uint32_t
+sched_timer_peek_budget(uint32_t now, uint32_t max_ticks)
+{
+    uint32_t waketime = SchedStatus.timer_list->waketime;
+    if (timer_is_before(waketime, now))
+        return 0;
+    uint32_t avail = waketime - now;
+    if (avail > max_ticks)
+        return max_ticks;
+    return avail;
+}
+
+// 2B step 4: read-only verification command for sched_timer_peek_budget()
+// above -- reports the current raw scheduling-layer sleep budget so it
+// can be checked against known periodic timers (see docs/
+// 2b_step4_timer_peek.md) without actually sleeping. Not wired into
+// any low-power path.
+void
+command_get_timer_budget(uint32_t *args)
+{
+    uint32_t max_ticks = args[0];
+    irqstatus_t flag = irq_save();
+    uint32_t now = timer_read_time();
+    uint32_t budget = sched_timer_peek_budget(now, max_ticks);
+    irq_restore(flag);
+    sendf("timer_budget now=%u budget=%u", now, budget);
+}
+DECL_COMMAND(command_get_timer_budget, "get_timer_budget max_ticks=%u");
+
 
 /****************************************************************
  * Tasks

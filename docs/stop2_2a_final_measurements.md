@@ -1,5 +1,9 @@
 # Stop2 Milestone 2A — 最終量測（250000 baud）+ 整夜耐久
 
+> **⚠️ 前提存疑，待重驗**：本檔的 LSI 精確量測、整夜耐久、HSI16/LSI
+> 穩定性對照，都是在 OpenOCD `DBG_STOP=1` 下量測的，MCU 可能從未真正
+> 進入省電意義上的 Stop2。詳見 [[2b_debug_mode_artifact]]。
+
 延續 [[baud_250000_migration]]。韌體已確認為 250000 baud 版（`e9985ad2`，BRR
 驗證 `0x4000`，`klipper.service` `state=ready`，`srtt=0.002`）。本輪不改任何
 程式碼、不 make、不重燒，純粹用 `console.py -b 250000` 直接對 MCU 下

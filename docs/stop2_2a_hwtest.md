@@ -1,5 +1,9 @@
 # Stop2 Milestone 2A — 硬體遙測掃描（IWDG 邊界）
 
+> **⚠️ 前提存疑，待重驗**：本檔的 IWDG 逾時邊界掃描、以及「Stop2
+> 進出是否成立」一節的結論，都是在 OpenOCD `DBG_STOP=1` 下量測的，
+> MCU 可能從未真正進入省電意義上的 Stop2。詳見 [[2b_debug_mode_artifact]]。
+
 > **⚠️ 參數設計有誤，適用範圍更正**：以下從「前置檢查」到「無法從這組數據
 > 判定的事」為止的第一輪掃描，六組全部用 `cycles≥3`，總睡眠時間
 > （`cycles×period_ms`）全部 ≥1000ms，必然超過 IWDG 的 410-512ms 預算，

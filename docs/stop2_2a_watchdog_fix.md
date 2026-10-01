@@ -1,5 +1,11 @@
 # Stop2 Milestone 2A — IWDG 餵狗修復 + LSI 精確量測
 
+> **⚠️ 前提存疑，待重驗**：本檔的 LSI 精確頻率估計、IWDG 逾時邊界、
+> 整夜耐久測試，都是在 OpenOCD `DBG_STOP=1`（除錯模式強制所有時脈
+> 保持運作）下量測的，MCU 可能從未真正進入省電意義上的 Stop2。階段1
+> 的 IWDG 餵狗時機修正本身是獨立的程式碼正確性修復，不受影響。詳見
+> [[2b_debug_mode_artifact]]。
+
 延續 `5a208532`。前兩輪（`98c213cb`、`5a208532`）已確立：Stop2 進出本身
 成立（每一次完成的循環都回報 `sws=3 pll1rdy=1 restore_timeout=0
 lptim_timeout=0 entry_fail=0`），觀察到的所有重置都來自 IWDG，不是

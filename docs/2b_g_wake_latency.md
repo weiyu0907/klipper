@@ -1,5 +1,13 @@
 # Milestone 2B G — Stop2 喚醒延遲遙測
 
+> **⚠️ G6 結論作廢，待 D3 重驗；G3/G5 不受影響**：G6（§7，「HSI16 在
+> Stop2 期間全程沒關」）是在 OpenOCD `DBG_STOP=1` 下用 `cr_at_wake`
+> 讀的，這個條件本身就會強制所有振盪器保持開啟，不能證明真正 Stop2
+> 下的行為，結論作廢，需要在 `DBG_STOP=0` 下重驗（D3，尚未執行）。
+> G3（`total_latency`/`restore_us`）、G5（`STOPWUCK=1` 對照）都是喚醒
+> **之後**才開始量測，不依賴「Stop 期間時脈停止」這個前提，不受影響。
+> 詳見 [[2b_debug_mode_artifact]]。
+
 延續 [[2b_step0_lpuart_lse]]。目的：直接量測 Stop2 喚醒（`wfi` 返回到
 `stm32u5_sysclk_restore()` 完成）實際花多久，取代 C1/C5 裡完全空白的
 `wake_latency` 數字。會改韌體，已依指示在燒錄前停下讓使用者過目 diff，

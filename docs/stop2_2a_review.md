@@ -1,5 +1,10 @@
 # Stop2 Milestone 2A — 外部審查修復報告
 
+> **註：不受 [[2b_debug_mode_artifact]] 影響**。該文件記錄了 OpenOCD
+> `DBG_STOP=1` 讓本專案至今的 Stop2 測試可能都不是真正的 Stop2，但本檔
+> 的四個修復都是程式碼健壯性問題（PLL relock 檢查、忙等 timeout、
+> SYSCLK 來源回報、LPTIM1 寫入時機），跟 `DBG_STOP` 無關，結論仍然成立。
+
 延續 commit `e701a40a`（"stm32u5: add Stop2 feasibility test (Milestone 2A)"）。
 本輪修復外部審查提出的四個問題，並補上 LPTIM1 寫入時機稽核。範圍仍嚴格
 限制在「Stop2 進出可行性驗證」：不做時鐘飄移補償、不碰 DWT CYCCNT、不動
